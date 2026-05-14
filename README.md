@@ -310,11 +310,11 @@ API Key 与账号信息配置文件，直接手动编辑即可：
 
 ## 接入第三方客户端
 
-### OpenClaw
+### CCSwitch
 
-1. 打开 OpenClaw → **设置** → **供应商配置** → **添加供应商**
+1. 打开 CCSwitch → **设置** → **供应商配置** → **添加供应商**
 
-   ![OpenClaw 供应商配置](docs/openclaw-setup.png)
+   ![CCSwitch 供应商配置](docs/openclaw-setup.png)
 
 2. 填写以下信息：
 
