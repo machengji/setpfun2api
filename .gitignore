@@ -3,4 +3,5 @@ node_modules/
 logs/
 .vercel
 data/
+config/api.json
 

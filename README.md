@@ -35,9 +35,24 @@
 2. 按 `F12` 打开浏览器开发者工具
 3. 在 **Application → Local Storage** 中找到并复制 `deviceId` 的值
 4. 在 **Application → Cookies** 中找到并复制 `Oasis-Token` 的值
-5. 将两者用 `@` 拼接：`{deviceId}@{Oasis-Token}`
+5. 将 `deviceId` 和 `Oasis-Token` 分别填写到 `config/api.json` 的对应字段中即可：
 
-> 这个字符串即为调用 API 时使用的 Token（refresh_token）。
+```json
+{
+  "admin_key": "your-admin-key",
+  "api_keys": {
+    "sk-your-key": {
+      "name": "账号备注",
+      "accounts": [
+        {
+          "device_id": "粘贴 deviceId 到这里",
+          "oasis_token": "粘贴 Oasis-Token 到这里"
+        }
+      ]
+    }
+  }
+}
+```
 
 ---
 
@@ -115,20 +130,6 @@ Authorization: Bearer sk-your-key
 ```
 
 多账号只需在 `accounts` 数组中添加多个对象，服务会自动轮询。
-
-### 兼容方式：直接使用 refresh_token
-
-也可以将 `deviceId` 和 `Oasis-Token` 用 `@` 拼接后直接作为 Bearer Token：
-
-```
-Authorization: Bearer {deviceId}@{Oasis-Token}
-```
-
-多账号逗号分隔，自动轮询：
-
-```
-Authorization: Bearer token1,token2,token3
-```
 
 ---
 

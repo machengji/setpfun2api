@@ -1,0 +1,16 @@
+{
+  "_comment": "API 配置示例 - 复制此文件为 api.json 并填写真实信息",
+  "_token_format": "accounts 里分别填写 Device ID (Oasis-Webid) 和 Oasis-Token",
+  "admin_key": "your-admin-key",
+  "api_keys": {
+    "sk-your-key": {
+      "name": "账号备注",
+      "accounts": [
+        {
+          "device_id": "粘贴 deviceId 到这里",
+          "oasis_token": "粘贴 Oasis-Token 到这里"
+        }
+      ]
+    }
+  }
+}
