@@ -258,8 +258,14 @@ curl http://localhost:8000/v1/upload/file \
 | `SERVER_ENV` | 运行环境（对应 `configs/` 下目录名） | `dev` |
 | `STEPFUN_BROWSER_MODE` | 设为 `1` 启用浏览器模式 | 未设置 |
 | `STEPFUN_ALLOW_AGENT_TOOLS` | 设为 `1` 允许 agent/explore 工具 | 未设置 |
+| `STEPFUN_STREAM_TIMEOUT_MS` | 浏览器流式响应超时时间，超时后会重新创建对话并要求简单回复 | `60000` |
+| `STEPFUN_STREAM_TIMEOUT_RETRY_COUNT` | 浏览器流式响应超时重试次数 | `1` |
+| `STEPFUN_STREAM_TIMEOUT_RETRY_PROMPT` | 超时重试时追加的简短回复提示词 | `请简单回复，避免长时间思考或循环。` |
+| `STEPFUN_CHINESE_REPLY_PROMPT` | 默认追加的中文回复提示词 | 强制中文回复，并避免误判 `DS2API_HISTORY.txt` 为空 |
 | `STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS` | 历史记录写入文件的最小字符数 | `0` |
 | `STEPFUN_CURRENT_INPUT_LIVE_MAX_CHARS` | 历史记录文件最大字符数 | `20000` |
+| `STEPFUN_CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS` | 历史上下文超过该字符数时请求模型压缩总结 | `200000` |
+| `STEPFUN_CURRENT_INPUT_SUMMARY_MAX_CHARS` | 压缩总结后的最大字符数 | `40000` |
 | `STEPFUN_CONVERSATION_CREATE_MIN_DELAY_MS` | 创建会话最小间隔（ms） | `1000` |
 | `STEPFUN_CONVERSATION_CREATE_MAX_DELAY_MS` | 创建会话最大间隔（ms） | `3000` |
 
