@@ -1,6 +1,6 @@
 # step-free-api
 
-将 [跃问 StepChat](https://yuewen.cn) 网页版接口转换为 OpenAI 兼容的 API 服务。
+将 [StepFun](https://www.stepfun.com/chats/new) 网页版接口转换为 OpenAI 兼容的 API 服务。
 
 **支持特性：**
 - ✅ OpenAI Chat Completions API 兼容（`/v1/chat/completions`）
@@ -32,7 +32,7 @@
 
 ## 获取 Token
 
-1. 打开 [yuewen.cn](https://yuewen.cn) 并登录
+1. 打开 [stepfun.com](https://www.stepfun.com/chats/new) 并登录
 2. 按 `F12` 打开浏览器开发者工具
 3. 在 **Application → Local Storage** 中找到并复制 `deviceId` 的值
 4. 在 **Application → Cookies** 中找到并复制 `Oasis-Token` 的值
@@ -44,7 +44,7 @@
 
 ## 快速启动
 
-> **注意：** 本项目需要使用**浏览器模式**才能正常对话。浏览器模式通过 Playwright 驱动真实浏览器与 StepChat 交互，非浏览器模式（直接 HTTP）目前无法正常收发消息。
+> **注意：** 本项目需要使用**浏览器模式**才能正常对话。浏览器模式通过 Playwright 驱动真实浏览器与 StepFun 交互，非浏览器模式（直接 HTTP）目前无法正常收发消息。
 
 ### 本地运行（浏览器模式）
 
@@ -390,11 +390,11 @@ API Key 与管理员密钥持久化存储（由 Admin 接口自动维护，也�
 
 ## 实现原理
 
-本项目是一个 **API 代理层**，将 StepChat 网页端内部接口封装为标准 OpenAI / Anthropic API 格式：
+本项目是一个 **API 代理层**，将 StepFun 网页端内部接口封装为标准 OpenAI / Anthropic API 格式：
 
-1. **认证** — 使用 `deviceId` + `Oasis-Token` 调用 StepChat 的 RefreshToken 接口，换取有效期内的 `access_token`（缓存 15 分钟）
+1. **认证** — 使用 `deviceId` + `Oasis-Token` 调用 StepFun 的 RefreshToken 接口，换取有效期内的 `access_token`（缓存 15 分钟）
 2. **会话** — 每次请求创建临时对话会话，对话结束后自动清理
-3. **流式响应** — 对接 StepChat 的 protobuf 流式接口，实时转换为 SSE 格式返回
+3. **流式响应** — 对接 StepFun 的 protobuf 流式接口，实时转换为 SSE 格式返回
 4. **多轮对话** — 将历史消息序列化为文件上传，以此实现上下文传递
 5. **工具调用** — 通过 DSML 标签将工具描述注入提示词，解析模型输出并还原为 OpenAI `tool_calls` / Anthropic `tool_use` 格式
 6. **浏览器模式** — 使用 Playwright 驱动真实浏览器进行交互，用于规避风控
@@ -405,4 +405,4 @@ API Key 与管理员密钥持久化存储（由 Admin 接口自动维护，也�
 
 - 本项目仅供学习与技术研究，请勿用于任何商业或违法用途
 - 使用本项目造成的任何后果由使用者自行承担
-- 本项目与 StepFun / 阶跃星辰无任何关联
+- 本项目与 阶跃星辰 无任何关联
