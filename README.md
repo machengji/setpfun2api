@@ -21,7 +21,6 @@
 - [快速启动](#快速启动)
 - [认证方式](#认证方式)
 - [API 接口](#api-接口)
-- [Admin 管理接口](#admin-管理接口)
 - [环境变量](#环境变量)
 - [配置文件](#配置文件)
 - [接入第三方客户端](#接入第三方客户端)
@@ -86,9 +85,40 @@ curl http://localhost:8001/ping
 
 ## 认证方式
 
-所有接口均通过 `Authorization` 请求头传入凭证，支持两种方式：
+所有接口均通过 `Authorization` 请求头传入凭证。
 
-### 方式一：直接使用 refresh_token（向后兼容）
+### 推荐方式：编辑 config/api.json（直接配置）
+
+在 `config/api.json` 中填写账号信息和 API Key：
+
+```json
+{
+  "admin_key": "your-admin-key",
+  "api_keys": {
+    "sk-your-key": {
+      "name": "账号备注",
+      "accounts": [
+        {
+          "device_id": "你的deviceId",
+          "oasis_token": "你的Oasis-Token"
+        }
+      ]
+    }
+  }
+}
+```
+
+填好后调用接口时直接使用：
+
+```
+Authorization: Bearer sk-your-key
+```
+
+多账号只需在 `accounts` 数组中添加多个对象，服务会自动轮询。
+
+### 兼容方式：直接使用 refresh_token
+
+也可以将 `deviceId` 和 `Oasis-Token` 用 `@` 拼接后直接作为 Bearer Token：
 
 ```
 Authorization: Bearer {deviceId}@{Oasis-Token}
@@ -98,14 +128,6 @@ Authorization: Bearer {deviceId}@{Oasis-Token}
 
 ```
 Authorization: Bearer token1,token2,token3
-```
-
-### 方式二：使用 API Key（推荐）
-
-通过 [Admin 接口](#admin-管理接口) 创建 API Key 并绑定多个账号，之后直接使用 API Key：
-
-```
-Authorization: Bearer sk-your-api-key
 ```
 
 ---
@@ -226,64 +248,6 @@ curl http://localhost:8000/v1/upload/file \
 
 ---
 
-## Admin 管理接口
-
-Admin 接口需要在请求头中携带管理员密钥（默认为 `admin`，强烈建议修改）：
-
-```
-Authorization: Bearer admin
-```
-
-### GET /admin/status
-
-获取当前系统状态（已配置 API Key 数量等）。
-
-### GET /admin/api-keys
-
-列出所有 API Key。
-
-### POST /admin/api-keys
-
-创建 API Key。
-
-```json
-{
-  "key": "sk-my-key",
-  "name": "我的账号组",
-  "accounts": [
-    {"device_id": "xxx", "oasis_token": "yyy"},
-    {"device_id": "aaa", "oasis_token": "bbb"}
-  ],
-  "remark": "备注（可选）"
-}
-```
-
-### DELETE /admin/api-keys
-
-删除 API Key。
-
-```json
-{ "key": "sk-my-key" }
-```
-
-### POST /admin/admin-key
-
-修改管理员密钥。
-
-```json
-{ "new_key": "新的管理员密钥" }
-```
-
-### POST /admin/config/reload
-
-重新加载 `config/api.json` 配置（无需重启）。
-
-### POST /admin/browser-conversation/reset
-
-重置浏览器模式下的会话状态。
-
----
-
 ## 环境变量
 
 | 变量 | 说明 | 默认值 |
@@ -325,7 +289,7 @@ tmpFileExpires: 86400000  # 临时文件有效期（ms）
 
 ### config/api.json
 
-API Key 与管理员密钥持久化存储（由 Admin 接口自动维护，也可手动编辑）：
+API Key 与账号信息配置文件，直接手动编辑即可：
 
 ```json
 {
