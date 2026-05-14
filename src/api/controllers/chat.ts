@@ -57,8 +57,14 @@ const CURRENT_INPUT_FILENAME = "DS2API_HISTORY.txt";
 const CURRENT_INPUT_CONTENT_TYPE = "text/plain; charset=utf-8";
 const CURRENT_INPUT_MIN_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS || 0);
 const CURRENT_INPUT_LIVE_MAX_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_LIVE_MAX_CHARS || 20000);
+const CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS || 200000);
+const CURRENT_INPUT_SUMMARY_MAX_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_SUMMARY_MAX_CHARS || 40000);
 const CONVERSATION_CREATE_MIN_DELAY_MS = Number(process.env.STEPFUN_CONVERSATION_CREATE_MIN_DELAY_MS || 1000);
 const CONVERSATION_CREATE_MAX_DELAY_MS = Number(process.env.STEPFUN_CONVERSATION_CREATE_MAX_DELAY_MS || 3000);
+const STREAM_TIMEOUT_MS = Number(process.env.STEPFUN_STREAM_TIMEOUT_MS || 60000);
+const STREAM_TIMEOUT_RETRY_COUNT = Number(process.env.STEPFUN_STREAM_TIMEOUT_RETRY_COUNT || 1);
+const STREAM_TIMEOUT_RETRY_PROMPT = process.env.STEPFUN_STREAM_TIMEOUT_RETRY_PROMPT || "请简单回复，避免长时间思考或循环。";
+const CHINESE_REPLY_PROMPT = process.env.STEPFUN_CHINESE_REPLY_PROMPT || "除非用户明确要求其他语言，否则必须使用简体中文回复。如果上下文提到 DS2API_HISTORY.txt，但附件不可读或未展示完整正文，请使用消息中可见的内联 Context，不要断言该文件为空。";
 let conversationCreateNextAt = 0;
 let conversationCreateThrottleQueue = Promise.resolve();
 
@@ -680,11 +686,31 @@ async function createCompletionStream(
       const result = await createBrowserChatStream(refreshToken, convId, messagesPrepare(convId, currentInput.messages, currentInput.refs));
       const streamStartTime = util.timestamp();
       logger.info(`Browser ChatStream started, convId=${convId}`);
-      return createTransStream(model, convId, result, () => {
+      const transStream = createTransStream(model, convId, result, () => {
         logger.success(
           `Browser stream has completed transfer ${util.timestamp() - streamStartTime}ms`
         );
-      }, tools);
+      }, tools, { endOnSourceClose: false });
+      if (STREAM_TIMEOUT_MS > 0 && retryCount < STREAM_TIMEOUT_RETRY_COUNT) {
+        const timeout = setTimeout(async () => {
+          if (transStream.destroyed || transStream.writableEnded) return;
+          logger.warn(`Browser stream timed out after ${STREAM_TIMEOUT_MS}ms, retrying with simple reply prompt`);
+          result.destroy(new Error("Browser stream timeout"));
+          const retryStream = await createCompletionStream(
+            model,
+            withSimpleReplyPrompt(messages),
+            refreshToken,
+            useSearch,
+            tools,
+            toolChoice,
+            retryCount + 1
+          );
+          retryStream.pipe(transStream, { end: true });
+        }, STREAM_TIMEOUT_MS);
+        transStream.once("close", () => clearTimeout(timeout));
+        transStream.once("finish", () => clearTimeout(timeout));
+      }
+      return transStream;
     }
     // 创建会话
     const convId = await createConversation(refreshToken);
@@ -777,14 +803,10 @@ function extractRefFileUrls(messages: any[]) {
   return urls;
 }
 
-function latestTurnMessages(messages: any[]) {
-  if (!messages.length) return messages;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if ((messages[i]?.role || "user") === "user") {
-      return [messages[i]];
-    }
-  }
-  return [messages[messages.length - 1]];
+function withSimpleReplyPrompt(messages: any[]) {
+  const promptMessage = { role: "system", content: STREAM_TIMEOUT_RETRY_PROMPT, __stepFreeTimeoutRetryPrompt: true };
+  if (messages.some((message) => message?.__stepFreeTimeoutRetryPrompt)) return messages;
+  return [promptMessage, ...messages];
 }
 
 /**
@@ -805,12 +827,14 @@ function messagesPrepare(chatSessionId: string, messages: any[], refs: any[]) {
         return message.content.reduce((_content, v) => {
           if (!_.isObject(v) || v["type"] != "text") return _content;
           const text = _.isString(v["text"]) ? v["text"] : JSON.stringify(v["text"]);
+          if (!text) return _content;
           return _content + `${message.role || "user"}:${text || ""}\n`;
         }, content);
       }
       const msgContent = _.isString(message.content) ? message.content : JSON.stringify(message.content);
+      if (!msgContent) return content;
       return (content += `${message.role || "user"}:${msgContent}\n`);
-    }, "") + "assistant:";
+    }, `system:${CHINESE_REPLY_PROMPT}\n`) + "assistant:";
 
   logger.info("\n对话合并：\n" + content);
 
@@ -956,6 +980,51 @@ function clampPromptText(text: string, maxChars: number) {
   return `${text.slice(0, Math.floor(maxChars / 2))}\n\n[...middle content omitted...]\n\n${text.slice(-Math.floor(maxChars / 2))}`;
 }
 
+async function summarizeLongContext(text: string, refreshToken: string) {
+  if (CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS <= 0 || text.length < CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS) return text;
+  logger.info(`Current input context exceeds summarize threshold: ${text.length}/${CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS}`);
+  const summaryPrompt = [
+    "请将下面的历史上下文压缩总结为后续对话可继续使用的上下文。",
+    `要求：保留用户目标、已完成操作、关键文件/代码改动、错误与解决方案、待办事项、重要约束；删除重复日志和无关工具清单；使用简体中文；长度尽量控制在 ${CURRENT_INPUT_SUMMARY_MAX_CHARS} 字以内。`,
+    "",
+    "历史上下文：",
+    text,
+  ].join("\n");
+  try {
+    const convId = process.env.STEPFUN_BROWSER_MODE === "1"
+      ? await createBrowserConversation(refreshToken)
+      : await createConversation(refreshToken);
+    const body = messagesPrepare(convId, [{ role: "user", content: summaryPrompt }], []);
+    const tokenInfo = process.env.STEPFUN_BROWSER_MODE === "1" ? null : await acquireToken(refreshToken);
+    const stream = process.env.STEPFUN_BROWSER_MODE === "1"
+      ? await createBrowserChatStream(refreshToken, convId, body)
+      : (await axios.post(
+          "https://www.stepfun.com/api/agent/capy.agent.v1.AgentService/ChatStream",
+          body,
+          {
+            headers: {
+              "Content-Type": "application/connect+json",
+              Cookie: generateCookie(tokenInfo!.deviceId, tokenInfo!.token),
+              "Oasis-Webid": tokenInfo!.deviceId,
+              "Canary": false,
+              Referer: `https://www.stepfun.com/chats/${convId}`,
+              ...FAKE_HEADERS,
+            },
+            timeout: 120000,
+            validateStatus: () => true,
+            responseType: "stream",
+          }
+        )).data;
+    const answer: any = await receiveStream(MODEL_NAME, convId, stream);
+    const summary = String(answer?.choices?.[0]?.message?.content || "").trim();
+    if (!summary) throw new Error("empty summary");
+    return `# ${CURRENT_INPUT_FILENAME} 压缩总结\n\n${clampPromptText(summary, CURRENT_INPUT_SUMMARY_MAX_CHARS)}\n`;
+  } catch (err) {
+    logger.warn(`Current input context summarize failed, falling back to clipped context: ${err instanceof Error ? err.message : String(err)}`);
+    return clampPromptText(text, CURRENT_INPUT_SUMMARY_MAX_CHARS);
+  }
+}
+
 function hasPromptOverflowArtifacts(messages: any[]) {
   return messages.some((message) => {
     if (shouldIgnorePromptHistoryMessage(message)) return false;
@@ -1012,9 +1081,10 @@ function hasTrailingToolResult(messages: any[]) {
 async function applyCurrentInputFileIfNeeded(messages: any[], refs: any[], refreshToken: string) {
   if (process.env.STEPFUN_CURRENT_INPUT_FILE_ENABLED === "0") return { messages, refs };
   const latestUser = findLatestUserMessage(messages);
-  const transcript = buildHistoryTranscript(messages, latestUser.index);
+  let transcript = buildHistoryTranscript(messages, latestUser.index);
   if (!transcript.trim()) return { messages, refs };
   if (transcript.length < CURRENT_INPUT_MIN_CHARS && !hasPromptOverflowArtifacts(messages)) return { messages, refs };
+  transcript = await summarizeLongContext(transcript, refreshToken);
   const toolPromptMessages = messages.filter((message) => message?.__stepFreeToolPrompt);
   const latestUserContent = clampPromptText(latestUser.content, CURRENT_INPUT_LIVE_MAX_CHARS);
   const continuationPrefix = hasTrailingToolResult(messages)
@@ -1023,9 +1093,10 @@ async function applyCurrentInputFileIfNeeded(messages: any[], refs: any[], refre
   try {
     const ref = await uploadCurrentInputFile(transcript, refreshToken);
     logger.info(`Current input context (${transcript.length} chars) moved to attached ${CURRENT_INPUT_FILENAME}`);
+    const inlineTranscript = clampPromptText(transcript, CURRENT_INPUT_LIVE_MAX_CHARS);
     const latestUserPrompt = latestUserContent
-      ? `${continuationPrefix}Use the provided prior context internally. Do not call tools to read context files. Treat historical tool calls/results as already completed and do not repeat them. Continue the task from that context.\n\nLatest user request:\n${latestUserContent}`
-      : `${continuationPrefix}Use the provided prior context internally. Do not call tools to read context files. Treat historical tool calls/results as already completed and do not repeat them. Continue the task from that context and answer the latest user request directly.`;
+      ? `${continuationPrefix}Use the provided prior context internally. The same context is attached as ${CURRENT_INPUT_FILENAME} and also included below for reliability. Treat historical tool calls/results as already completed and do not repeat them. Continue the task from that context. If the attachment cannot be read, use the inline context below and do not claim the file is empty.\n\nContext:\n${inlineTranscript}\n\nLatest user request:\n${latestUserContent}`
+      : `${continuationPrefix}Use the provided prior context internally. The same context is attached as ${CURRENT_INPUT_FILENAME} and also included below for reliability. Treat historical tool calls/results as already completed and do not repeat them. Continue the task from that context and answer the latest user request directly. If the attachment cannot be read, use the inline context below and do not claim the file is empty.\n\nContext:\n${inlineTranscript}`;
     return {
       messages: [...toolPromptMessages, {
         role: "user",
@@ -1205,7 +1276,8 @@ function createTransStream(
   convId: string,
   stream: any,
   endCallback?: Function,
-  tools?: any[]
+  tools?: any[],
+  options: { endOnSourceClose?: boolean } = {}
 ) {
   // 消息创建时间
   const created = util.unixTimestamp();
@@ -1484,6 +1556,7 @@ function createTransStream(
   stream.once(
     "error",
     () => {
+      if (options.endOnSourceClose === false && !ended) return;
       if (hasTools && !processed) processBufferedText();
       else finishStream();
     }
@@ -1491,6 +1564,7 @@ function createTransStream(
   stream.once(
     "close",
     () => {
+      if (options.endOnSourceClose === false && !ended) return;
       if (hasTools && !processed) processBufferedText();
       else finishStream();
     }
