@@ -901,7 +901,7 @@ function messagesPrepare(chatSessionId: string, messages: any[], refs: any[]) {
     },
     config: {
       model: "step-auto",
-      enableReasoning: true,
+      enableReasoning: false,
     },
   };
 
@@ -1198,7 +1198,6 @@ function checkResult(result: AxiosResponse, refreshToken: string) {
 
 function extractStepFunEventText(event: any) {
   if (event?.textEvent?.text) return String(event.textEvent.text);
-  if (event?.reasoningEvent?.text) return String(event.reasoningEvent.text);
   const content = event?.messageEvent?.message?.content;
   const assistantMessage = content?.assistantMessage;
   const qa = assistantMessage?.qa;
