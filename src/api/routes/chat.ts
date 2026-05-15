@@ -23,7 +23,12 @@ export default {
             if (request.body.stream) {
                 const stream = await chat.createCompletionStream(model, messages, token, request.body.use_search, tools, toolChoice);
                 return new Response(stream, {
-                    type: "text/event-stream"
+                    type: "text/event-stream",
+                    headers: {
+                        "Cache-Control": "no-cache, no-transform",
+                        Connection: "keep-alive",
+                        "X-Accel-Buffering": "no"
+                    }
                 });
             }
             else

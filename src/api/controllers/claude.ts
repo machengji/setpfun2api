@@ -754,10 +754,7 @@ export async function createClaudeMessageStream(
 
   function handleToolSieveContent(content: string) {
     if (!content) return;
-    if (hasTools) {
-      completeText += content;
-      return;
-    }
+    completeText += content;
     if (!hasStarted) startMessage();
     if (!hasTextBlock) ensureTextBlock();
     emitTextDelta(content);
@@ -836,7 +833,7 @@ export async function createClaudeMessageStream(
           finishWithPauseTurn();
           return;
         }
-        processCompleteText(rawText);
+        finishWithText(completeText);
       } else {
         processed = true;
         if (!completeText.trim() && (!sawOpenAIDone || !sawOpenAIFinishReason)) {

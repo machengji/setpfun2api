@@ -8,18 +8,33 @@ export interface ToolStreamEvent {
 export interface ToolSieveState {
   buffering: boolean;
   captured: string;
+  pending: string;
 }
 
 export function createToolSieveState(): ToolSieveState {
-  return { buffering: false, captured: '' };
+  return { buffering: false, captured: '', pending: '' };
 }
 
 export function processToolStreamChunk(state: ToolSieveState, chunk: string): ToolStreamEvent[] {
   if (!chunk) return [];
-  if (!state.buffering && !looksLikeToolStart(chunk)) return [{ content: chunk }];
+  if (!state.buffering) {
+    const text = state.pending + chunk;
+    state.pending = '';
+    if (!looksLikeToolStart(text)) {
+      const tailLength = possibleToolStartTailLength(text);
+      if (tailLength > 0) {
+        state.pending = text.slice(-tailLength);
+        const content = text.slice(0, -tailLength);
+        return content ? [{ content }] : [];
+      }
+      return [{ content: text }];
+    }
+    state.captured += text;
+  } else {
+    state.captured += chunk;
+  }
 
   state.buffering = true;
-  state.captured += chunk;
 
   const consumed = consumeToolCapture(state.captured, false);
   if (!consumed.ready) return [];
@@ -30,10 +45,11 @@ export function processToolStreamChunk(state: ToolSieveState, chunk: string): To
 }
 
 export function flushToolStream(state: ToolSieveState): ToolStreamEvent[] {
-  if (!state.captured) return [];
-  const captured = state.captured;
+  if (!state.captured && !state.pending) return [];
+  const captured = state.captured + state.pending;
   state.buffering = false;
   state.captured = '';
+  state.pending = '';
   const consumed = consumeToolCapture(captured, true);
   const events = expandConsumedEvents(state, consumed);
   return events.length ? events : [{ content: captured }];
@@ -93,6 +109,17 @@ function consumeToolCapture(captured: string, force: boolean): ConsumedCapture {
 function looksLikeToolStart(text: string): boolean {
   const lower = text.toLowerCase();
   return lower.includes('<|dsml|tool_calls') || lower.includes('<tool_calls') || lower.includes('<tool_call') || lower.includes('<|dsml|invoke') || lower.includes('<invoke') || lower.includes('<function=');
+}
+
+function possibleToolStartTailLength(text: string): number {
+  const lower = text.toLowerCase();
+  const markers = ['<|dsml|tool_calls', '<tool_calls', '<tool_call', '<|dsml|invoke', '<invoke', '<function='];
+  const maxLength = Math.min(lower.length, Math.max(...markers.map((marker) => marker.length - 1)));
+  for (let length = maxLength; length > 0; length--) {
+    const tail = lower.slice(-length);
+    if (markers.some((marker) => marker.startsWith(tail))) return length;
+  }
+  return 0;
 }
 
 function splitBeforeToolSyntax(text: string): string {

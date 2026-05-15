@@ -12,6 +12,11 @@ import {
   parseToolCallsDetailed,
   ParsedToolCall
 } from '@/api/controllers/toolcall.ts';
+import {
+  createToolSieveState,
+  flushToolStream,
+  processToolStreamChunk
+} from '@/api/controllers/toolstream.ts';
 import APIException from "@/lib/exceptions/APIException.ts";
 import EX from "@/api/consts/exceptions.ts";
 import logger from "@/lib/logger.ts";
@@ -1364,10 +1369,9 @@ function createTransStream(
     transStream.end("data: [DONE]\n\n");
   };
 
-  // 工具调用模式：缓冲所有文本，结束时解析
-  let bufferedText = '';
   let bufferedRefContent = '';
   let processed = false;
+  const toolSieve = createToolSieveState();
 
   function emitTextDelta(text: string) {
     if (!canWrite()) return;
@@ -1440,31 +1444,29 @@ function createTransStream(
     emitTextDelta(text);
   }
 
-  function processBufferedText() {
+  function handleToolSieveEvents(events: ReturnType<typeof processToolStreamChunk>) {
+    for (const event of events) {
+      if (processed || !canWrite()) return;
+      if (event.toolCalls && event.toolCalls.length > 0) {
+        processed = true;
+        logger.info(`Stream tool calls detected: ${event.toolCalls.map(c => c.name).join(', ')}`);
+        emitToolCalls(toOpenAIToolCalls(event.toolCalls));
+      } else if (event.content) {
+        emitTextDelta(event.content);
+      }
+    }
+  }
+
+  function finalizeToolStream() {
+    handleToolSieveEvents(flushToolStream(toolSieve));
     if (processed) return;
     processed = true;
-    let fullText = bufferedText;
     if (bufferedRefContent) {
-      fullText += `\n\n搜索结果来自：\n${bufferedRefContent.replace(/\n$/, "")}`;
+      emitTextOnly(`\n\n搜索结果来自：\n${bufferedRefContent.replace(/\n$/, "")}`);
     }
-
-    const parsed = parseToolCallsDetailed(fullText);
-    if (parsed.calls.length > 0) {
-      logger.info(`Stream tool calls detected: ${parsed.calls.map(c => c.name).join(', ')}`);
-      const toolCalls = toOpenAIToolCalls(parsed.calls);
-      emitToolCalls(toolCalls);
-    } else if (parsed.sawToolCallSyntax) {
-      const cleaned = fullText.replace(/<\|?DSML\|?tool_calls[\s\S]*/i, '').replace(/<\|?DSML\|?invoke[\s\S]*/i, '').trim();
-      emitTextOnly(cleaned || fullText);
-      emitFinishChunk("stop");
-      finishStream();
-      endCallback && endCallback();
-    } else {
-      emitTextOnly(fullText);
-      emitFinishChunk("stop");
-      finishStream();
-      endCallback && endCallback();
-    }
+    emitFinishChunk("stop");
+    finishStream();
+    endCallback && endCallback();
   }
 
   function emitFinishChunk(finishReason: string) {
@@ -1543,7 +1545,7 @@ function createTransStream(
       const text = extractStepFunEventText(event);
       if (text) {
         if (hasTools) {
-          bufferedText += text;
+          handleToolSieveEvents(processToolStreamChunk(toolSieve, text));
         } else {
           const data = `data: ${JSON.stringify({
             id: convId,
@@ -1564,7 +1566,7 @@ function createTransStream(
       } else if (event.startEvent || event.sourcingEvent) {
       } else if (event.doneEvent || event.messageDoneEvent) {
         if (hasTools) {
-          processBufferedText();
+          finalizeToolStream();
         } else {
           const data = `data: ${JSON.stringify({
             id: convId,
@@ -1613,7 +1615,7 @@ function createTransStream(
     "error",
     () => {
       if (options.endOnSourceClose === false && !ended) return;
-      if (hasTools && !processed) processBufferedText();
+      if (hasTools && !processed) finalizeToolStream();
       else finishStream();
     }
   );
@@ -1621,7 +1623,7 @@ function createTransStream(
     "close",
     () => {
       if (options.endOnSourceClose === false && !ended) return;
-      if (hasTools && !processed) processBufferedText();
+      if (hasTools && !processed) finalizeToolStream();
       else finishStream();
     }
   );

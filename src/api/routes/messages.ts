@@ -29,8 +29,9 @@ export default {
         return new Response(claudeStream, {
           type: 'text/event-stream',
           headers: {
-            'Cache-Control': 'no-cache',
+            'Cache-Control': 'no-cache, no-transform',
             Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
           },
         });
       }
