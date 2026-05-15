@@ -1,5 +1,6 @@
 import { PassThrough } from "stream";
 import path from "path";
+import fs from "fs/promises";
 import crypto from "crypto";
 import _ from "lodash";
 import mime from "mime";
@@ -692,13 +693,15 @@ async function createCompletionStream(
         );
       }, tools, { endOnSourceClose: false });
       if (STREAM_TIMEOUT_MS > 0 && retryCount < STREAM_TIMEOUT_RETRY_COUNT) {
+        logger.info(`Browser stream timeout guard enabled: ${STREAM_TIMEOUT_MS}ms`);
         const timeout = setTimeout(async () => {
           if (transStream.destroyed || transStream.writableEnded) return;
-          logger.warn(`Browser stream timed out after ${STREAM_TIMEOUT_MS}ms, retrying with simple reply prompt`);
+          logger.warn(`Browser stream timed out after ${STREAM_TIMEOUT_MS}ms, summarizing context before retry`);
           result.destroy(new Error("Browser stream timeout"));
+          const retryMessages = await withSummarizedRetryContext(messages, refreshToken);
           const retryStream = await createCompletionStream(
             model,
-            withSimpleReplyPrompt(messages),
+            retryMessages,
             refreshToken,
             useSearch,
             tools,
@@ -707,7 +710,6 @@ async function createCompletionStream(
           );
           retryStream.pipe(transStream, { end: true });
         }, STREAM_TIMEOUT_MS);
-        transStream.once("close", () => clearTimeout(timeout));
         transStream.once("finish", () => clearTimeout(timeout));
       }
       return transStream;
@@ -731,8 +733,7 @@ async function createCompletionStream(
           Referer: `https://www.stepfun.com/chats/${convId}`,
           ...FAKE_HEADERS,
         },
-        // 120秒超时
-        timeout: 120000,
+        timeout: STREAM_TIMEOUT_MS > 0 ? STREAM_TIMEOUT_MS : 120000,
         validateStatus: () => true,
         responseType: "stream",
       }
@@ -741,11 +742,32 @@ async function createCompletionStream(
     const streamStartTime = util.timestamp();
     logger.info(`ChatStream response status=${result.status}, convId=${convId} (streaming)`);
     // 创建转换流将消息格式转换为gpt兼容格式
-    return createTransStream(model, convId, result.data, () => {
+    const transStream = createTransStream(model, convId, result.data, () => {
       logger.success(
         `Stream has completed transfer ${util.timestamp() - streamStartTime}ms`
       );
     }, tools);
+    if (STREAM_TIMEOUT_MS > 0 && retryCount < STREAM_TIMEOUT_RETRY_COUNT) {
+      logger.info(`Stream timeout guard enabled: ${STREAM_TIMEOUT_MS}ms`);
+      const timeout = setTimeout(async () => {
+        if (transStream.destroyed || transStream.writableEnded) return;
+        logger.warn(`Stream timed out after ${STREAM_TIMEOUT_MS}ms, summarizing context before retry`);
+        result.data.destroy(new Error("Stream timeout"));
+        const retryMessages = await withSummarizedRetryContext(messages, refreshToken);
+        const retryStream = await createCompletionStream(
+          model,
+          retryMessages,
+          refreshToken,
+          useSearch,
+          tools,
+          toolChoice,
+          retryCount + 1
+        );
+        retryStream.pipe(transStream, { end: true });
+      }, STREAM_TIMEOUT_MS);
+      transStream.once("finish", () => clearTimeout(timeout));
+    }
+    return transStream;
   })().catch((err) => {
     if (retryCount < MAX_RETRY_COUNT) {
       logger.error(`Stream response error: ${err.message}`);
@@ -773,40 +795,67 @@ async function createCompletionStream(
  * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
  */
 function extractRefFileUrls(messages: any[]) {
-  const urls = [];
-  // 如果没有消息，则返回[]
-  if (!messages.length) {
-    return urls;
-  }
-  // 只获取最新的消息
-  const lastMessage = messages[messages.length - 1];
-  if (_.isArray(lastMessage.content)) {
-    lastMessage.content.forEach((v) => {
-      if (!_.isObject(v) || !["file", "image_url"].includes(v["type"])) return;
-      // step-free-api支持格式
-      if (
-        v["type"] == "file" &&
-        _.isObject(v["file_url"]) &&
-        _.isString(v["file_url"]["url"])
-      )
-        urls.push(v["file_url"]["url"]);
-      // 兼容gpt-4-vision-preview API格式
-      else if (
-        v["type"] == "image_url" &&
-        _.isObject(v["image_url"]) &&
-        _.isString(v["image_url"]["url"])
-      )
-        urls.push(v["image_url"]["url"]);
+  const urls: string[] = [];
+  if (!messages.length) return urls;
+  messages.forEach((message) => {
+    if (!_.isArray(message.content)) return;
+    message.content.forEach((item) => {
+      const url = extractContentFileUrl(item);
+      if (url && !urls.includes(url)) urls.push(url);
     });
-  }
+  });
   logger.info("本次请求上传：" + urls.length + "个文件");
   return urls;
+}
+
+function extractContentFileUrl(item: any) {
+  if (!_.isObject(item)) return "";
+  const type = String(item["type"] || "").toLowerCase();
+  if (type === "image_url") {
+    if (_.isString(item["image_url"])) return item["image_url"];
+    if (_.isObject(item["image_url"]) && _.isString(item["image_url"]["url"])) return item["image_url"]["url"];
+  }
+  if (type === "file" || type === "input_file" || type === "attachment") {
+    if (_.isString(item["file_url"])) return item["file_url"];
+    if (_.isObject(item["file_url"]) && _.isString(item["file_url"]["url"])) return item["file_url"]["url"];
+    if (_.isString(item["file"])) return item["file"];
+    if (_.isObject(item["file"]) && _.isString(item["file"]["url"])) return item["file"]["url"];
+    if (_.isString(item["url"])) return item["url"];
+  }
+  if (_.isString(item["url"]) && /^(https?:\/\/|data:)/i.test(item["url"])) return item["url"];
+  if (_.isString(item["url"])) return item["url"];
+  if (_.isString(item["path"])) return item["path"];
+  return "";
 }
 
 function withSimpleReplyPrompt(messages: any[]) {
   const promptMessage = { role: "system", content: STREAM_TIMEOUT_RETRY_PROMPT, __stepFreeTimeoutRetryPrompt: true };
   if (messages.some((message) => message?.__stepFreeTimeoutRetryPrompt)) return messages;
   return [promptMessage, ...messages];
+}
+
+async function withSummarizedRetryContext(messages: any[], refreshToken: string) {
+  const latestUser = findLatestUserMessage(messages);
+  const transcript = buildHistoryTranscript(messages, latestUser.index);
+  const summary = await summarizeLongContext(transcript, refreshToken, true);
+  const latestUserContent = latestUser.content || normalizeMessageContentForTranscript(messages[messages.length - 1]?.content);
+  return [
+    { role: "system", content: STREAM_TIMEOUT_RETRY_PROMPT, __stepFreeTimeoutRetryPrompt: true },
+    {
+      role: "user",
+      content: [
+        "前一次响应超时，旧对话已经终止。下面是压缩后的历史对话记录，请把它当成新的上下文继续处理最新请求。",
+        "不要复述压缩过程，不要重复已完成的工具调用，不要把系统工具说明当成用户内容。",
+        "",
+        "压缩后的历史对话记录：",
+        summary,
+        "",
+        "最新用户请求：",
+        latestUserContent,
+      ].join("\n"),
+      __stepFreeSummarizedRetry: true,
+    },
+  ];
 }
 
 /**
@@ -944,6 +993,10 @@ function normalizeMessageContentForTranscript(content: any): string {
 
 function sanitizePromptHistoryText(text: string) {
   return String(text || "")
+    .replace(/You are a personal assistant running inside OpenClaw\.[\s\S]*?(?=\n(?:user|assistant|system):|$)/gi, "[system tool instructions omitted]")
+    .replace(/## Tooling[\s\S]*?(?=\n## |\n(?:user|assistant|system):|$)/gi, "[tooling instructions omitted]")
+    .replace(/<available_skills>[\s\S]*?<\/available_skills>/gi, "[available skills omitted]")
+    .replace(/# Project Context[\s\S]*?(?=\n(?:user|assistant|system):|$)/gi, "[project context omitted]")
     .replace(/<\|DSML\|tool_calls[\s\S]*?<\/\|DSML\|tool_calls\s*>/gi, "[tool_calls omitted]")
     .replace(/<tool_calls[\s\S]*?<\/tool_calls\s*>/gi, "[tool_calls omitted]")
     .replace(/(?:<\|DSML\|invoke\b[\s\S]*?<\/\|DSML\|invoke\s*>\s*){2,}/gi, "[tool_calls omitted]")
@@ -971,6 +1024,9 @@ function isInterruptedRequestPlaceholder(text: string) {
 
 function shouldIgnorePromptHistoryMessage(message: any) {
   if (message?.__stepFreeToolPrompt) return true;
+  if (message?.__stepFreeSummarizedRetry) return true;
+  const role = String(message?.role || "user").toLowerCase();
+  if (role === "system" || role === "developer") return true;
   const text = sanitizePromptHistoryText(normalizeMessageContentForTranscript(message?.content)).trim();
   return isInternalContinuationPrompt(text) || isInterruptedRequestPlaceholder(text);
 }
@@ -980,12 +1036,12 @@ function clampPromptText(text: string, maxChars: number) {
   return `${text.slice(0, Math.floor(maxChars / 2))}\n\n[...middle content omitted...]\n\n${text.slice(-Math.floor(maxChars / 2))}`;
 }
 
-async function summarizeLongContext(text: string, refreshToken: string) {
-  if (CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS <= 0 || text.length < CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS) return text;
+async function summarizeLongContext(text: string, refreshToken: string, force = false) {
+  if (!force && (CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS <= 0 || text.length < CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS)) return text;
   logger.info(`Current input context exceeds summarize threshold: ${text.length}/${CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS}`);
   const summaryPrompt = [
-    "请将下面的历史上下文压缩总结为后续对话可继续使用的上下文。",
-    `要求：保留用户目标、已完成操作、关键文件/代码改动、错误与解决方案、待办事项、重要约束；删除重复日志和无关工具清单；使用简体中文；长度尽量控制在 ${CURRENT_INPUT_SUMMARY_MAX_CHARS} 字以内。`,
+    "请将下面的历史对话记录压缩总结为后续对话可继续使用的新上下文。",
+    `要求：只总结真实用户/助手对话内容；保留用户目标、已完成操作、关键文件/代码改动、错误与解决方案、待办事项、重要约束；忽略 system/developer 指令、工具协议、工具清单、Project Context、OpenClaw 运行说明、重复日志；使用简体中文；长度尽量控制在 ${CURRENT_INPUT_SUMMARY_MAX_CHARS} 字以内。`,
     "",
     "历史上下文：",
     text,
@@ -1080,6 +1136,7 @@ function hasTrailingToolResult(messages: any[]) {
 
 async function applyCurrentInputFileIfNeeded(messages: any[], refs: any[], refreshToken: string) {
   if (process.env.STEPFUN_CURRENT_INPUT_FILE_ENABLED === "0") return { messages, refs };
+  if (messages.some((message) => message?.__stepFreeSummarizedRetry)) return { messages, refs };
   const latestUser = findLatestUserMessage(messages);
   let transcript = buildHistoryTranscript(messages, latestUser.index);
   if (!transcript.trim()) return { messages, refs };
@@ -1657,9 +1714,6 @@ async function checkFileUrl(fileUrl: string) {
  * @param refreshToken 用于刷新access_token的refresh_token
  */
 async function uploadFile(fileUrl: string, refreshToken: string) {
-  // 预检查远程文件URL可用性
-  await checkFileUrl(fileUrl);
-
   let filename, fileData: Buffer, mimeType;
   // 如果是BASE64数据则直接转换为Buffer
   if (util.isBASE64Data(fileUrl)) {
@@ -1668,8 +1722,14 @@ async function uploadFile(fileUrl: string, refreshToken: string) {
     filename = `${util.uuid()}.${ext}`;
     fileData = Buffer.from(util.removeBASE64DataHeader(fileUrl), "base64");
   }
+  else if (!/^https?:\/\//i.test(fileUrl)) {
+    filename = path.basename(fileUrl);
+    fileData = await fs.readFile(fileUrl);
+  }
   // 下载文件到内存，如果您的服务器内存很小，建议考虑改造为流直传到下一个接口上，避免停留占用内存
   else {
+    // 预检查远程文件URL可用性
+    await checkFileUrl(fileUrl);
     filename = path.basename(fileUrl);
     const queryIndex = filename.indexOf("?");
     if (queryIndex != -1) filename = filename.substring(0, queryIndex);
