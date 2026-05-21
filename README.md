@@ -100,12 +100,14 @@ STEPFUN_ANONYMOUS_MODE=1 STEPFUN_BROWSER_MODE=1 node dist/index.js
 | `SERVER_HOST` | 服务绑定的主机地址。 | `0.0.0.0` |
 | `STEPFUN_BROWSER_MODE` | 设定为 `1` 时启用 Playwright 浏览器托管，以完美规避风控。 | `未设置` |
 | `STEPFUN_ANONYMOUS_MODE` | 设定为 `1` 时开启免账号匿名池模式。 | `未设置` |
+| `STEPFUN_ANONYMOUS_ROTATE_AFTER` | 单个匿名身份的最大使用对话轮数，到期强制后台平滑轮换。 | `3` |
+| `STEPFUN_ANONYMOUS_POOL_SIZE` | 预热匿名身份池的大小。若高频或并发使用建议调大此值。 | `8` |
 | `STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS` | **上下文压缩/文件化起征字符数**。只有当历史会话达到该长度时，才会触发云端文件归档，从而最大程度榨干 StepFun 原生超大上下文的实力。 | `200000` (约 200k 字符) |
 | `STEPFUN_CURRENT_INPUT_LIVE_MAX_CHARS` | 单次交互中允许的最大活跃上下文截断上限。 | `8000` |
 | `STEPFUN_CURRENT_INPUT_SUMMARY_MAX_CHARS` | 内存中本地 0-ms 裁剪的最大摘要字符数。 | `8000` |
 | `STEPFUN_CONVERSATION_CREATE_MIN_DELAY_MS` | 创建新对话的最小避让随机间隔（毫秒）。 | `1000` |
 | `STEPFUN_CONVERSATION_CREATE_MAX_DELAY_MS` | 创建新对话的最大避让随机间隔（毫秒）。 | `3000` |
-| `STEPFUN_STREAM_TIMEOUT_MS` | 单次网络请求超时阈值，超时后启动智能自愈。 | `60000` (60秒) |
+| `STEPFUN_STREAM_TIMEOUT_MS` | 单次网络请求超时阈值，超时后启动智能自愈。 | `120000` (120秒) |
 
 ---
 

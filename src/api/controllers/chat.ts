@@ -83,8 +83,17 @@ let browserStreamId = 0;
 export type StepFunAuth = { deviceId: string; token: string; cookie?: string; anonymous?: boolean };
 type AnonymousIdentity = StepFunAuth & { turns: number; createdAt: number; ingressCookie?: string };
 let anonymousIdentity: AnonymousIdentity | null = null;
-const ANONYMOUS_POOL_SIZE = 3;
+const ANONYMOUS_POOL_SIZE = Number(process.env.STEPFUN_ANONYMOUS_POOL_SIZE || 8);
 const anonymousIdentityPool: AnonymousIdentity[] = [];
+// 进程启动时静默预热匿名池，消灭首轮对话冷启动卡顿
+setTimeout(() => {
+  if (process.env.STEPFUN_ANONYMOUS_MODE === "1" || process.env.STEPFUN_FREE_MODE === "1") {
+    logger.info("[匿名凭据池] 核心服务就绪，开始在后台静默预热匿名凭证池...");
+    replenishAnonymousPool().catch(err => {
+      logger.error(`[匿名凭据池] 后台静默预热发生异常: ${err.message}`);
+    });
+  }
+}, 3000);
 let anonymousPoolReplenishing = false;
 const CURRENT_INPUT_FILENAME = "DS2API_HISTORY.txt";
 const CURRENT_INPUT_CONTENT_TYPE = "text/plain; charset=utf-8";
@@ -95,9 +104,9 @@ const CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS = Number(process.env.STEPFUN_CURRE
 const CURRENT_INPUT_SUMMARY_MAX_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_SUMMARY_MAX_CHARS || 8000);
 const CONVERSATION_CREATE_MIN_DELAY_MS = Number(process.env.STEPFUN_CONVERSATION_CREATE_MIN_DELAY_MS || 1000);
 const CONVERSATION_CREATE_MAX_DELAY_MS = Number(process.env.STEPFUN_CONVERSATION_CREATE_MAX_DELAY_MS || 3000);
-const STREAM_TIMEOUT_MS = Number(process.env.STEPFUN_STREAM_TIMEOUT_MS || 60000);
+const STREAM_TIMEOUT_MS = Number(process.env.STEPFUN_STREAM_TIMEOUT_MS || 120000);
 const STREAM_TIMEOUT_RETRY_COUNT = Number(process.env.STEPFUN_STREAM_TIMEOUT_RETRY_COUNT || 1);
-const STREAM_TIMEOUT_RETRY_PROMPT = process.env.STEPFUN_STREAM_TIMEOUT_RETRY_PROMPT || "请简单回复，避免长时间思考或循环。";
+const STREAM_TIMEOUT_RETRY_PROMPT = process.env.STEPFUN_STREAM_TIMEOUT_RETRY_PROMPT || "请简单回复，避免长时间思考 or 循环。";
 const CHINESE_REPLY_PROMPT = process.env.STEPFUN_CHINESE_REPLY_PROMPT || "除非用户明确要求其他语言，否则必须使用简体中文回复。如果上下文提到 DS2API_HISTORY.txt，但附件不可读或未展示完整正文，请使用消息中可见的内联 Context，不要断言该文件为空。";
 let lastConversationCreateAt = 0;
 
@@ -2253,20 +2262,20 @@ export function estimateTextTokens(text: string): number {
  * Explicación: Estimamos los tokens acumulados a partir de los mensajes para representar con precisión el prompt de entrada.
  */
 export function estimateMessagesTokens(messages: any[]): number {
-  let totalLength = 0;
+  let combinedText = "";
   for (const msg of messages) {
     if (!msg) continue;
     if (typeof msg.content === 'string') {
-      totalLength += msg.content.length;
+      combinedText += msg.content;
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
         if (part && typeof part === 'object' && part.type === 'text') {
-          totalLength += String(part.text || "").length;
+          combinedText += String(part.text || "");
         }
       }
     }
   }
-  return totalLength > 0 ? estimateTextTokens(totalLength > 0 ? " " : "") || Math.max(1, Math.ceil(totalLength / 1.5)) : 1;
+  return combinedText.length > 0 ? estimateTextTokens(combinedText) : 1;
 }
 
 /**
