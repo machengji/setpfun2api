@@ -108,12 +108,12 @@ function consumeToolCapture(captured: string, force: boolean): ConsumedCapture {
 
 function looksLikeToolStart(text: string): boolean {
   const lower = text.toLowerCase();
-  return lower.includes('<|dsml|tool_calls') || lower.includes('<tool_calls') || lower.includes('<tool_call') || lower.includes('<|dsml|invoke') || lower.includes('<invoke') || lower.includes('<function=');
+  return lower.includes('<|dsml|tool_calls') || lower.includes('<tool_calls') || lower.includes('<tool_call') || lower.includes('<|dsml|invoke') || lower.includes('<invoke') || lower.includes('<function=') || /<\|dsml\|[a-z0-9_.:-]+/i.test(text);
 }
 
 function possibleToolStartTailLength(text: string): number {
   const lower = text.toLowerCase();
-  const markers = ['<|dsml|tool_calls', '<tool_calls', '<tool_call', '<|dsml|invoke', '<invoke', '<function='];
+  const markers = ['<|dsml|tool_calls', '<tool_calls', '<tool_call', '<|dsml|invoke', '<invoke', '<function=', '<|dsml|'];
   const maxLength = Math.min(lower.length, Math.max(...markers.map((marker) => marker.length - 1)));
   for (let length = maxLength; length > 0; length--) {
     const tail = lower.slice(-length);
@@ -131,9 +131,14 @@ function splitBeforeToolSyntax(text: string): string {
     lower.indexOf('<|dsml|invoke'),
     lower.indexOf('<invoke'),
     lower.indexOf('<function='),
-  ].filter((index) => index >= 0);
-  if (starts.length === 0) return text;
-  return text.slice(0, Math.min(...starts));
+  ];
+  const dsmlMatch = /<\|dsml\|[a-z0-9_.:-]+/i.exec(text);
+  if (dsmlMatch && dsmlMatch.index !== undefined) {
+    starts.push(dsmlMatch.index);
+  }
+  const validStarts = starts.filter((index) => index >= 0);
+  if (validStarts.length === 0) return text;
+  return text.slice(0, Math.min(...validStarts));
 }
 
 function maybeIncompleteFunctionCall(text: string): boolean {

@@ -112,12 +112,26 @@ export function extractToolNames(tools: any[] | undefined): string[] {
 
 export function containsOpenToolCall(text: string): boolean {
   const lower = String(text || '').toLowerCase();
-  const openIndex = Math.max(
+  let openIndex = Math.max(
     lower.lastIndexOf('<|dsml|tool_calls'),
     lower.lastIndexOf('<tool_calls'),
     lower.lastIndexOf('<tool_call')
   );
-  if (openIndex < 0) return false;
+  if (openIndex < 0) {
+    const dsmlRegex = /<\|dsml\|(?!tool_calls\b|invoke\b|parameter\b)([a-z0-9_.:-]+)/gi;
+    let match;
+    let lastIndex = -1;
+    let matchedTagName = '';
+    while ((match = dsmlRegex.exec(text)) !== null) {
+      lastIndex = match.index;
+      matchedTagName = match[1].toLowerCase();
+    }
+    if (lastIndex >= 0) {
+      const after = lower.slice(lastIndex);
+      return !after.includes(`</|dsml|${matchedTagName}>`);
+    }
+    return false;
+  }
   const after = lower.slice(openIndex);
   return !after.includes('</|dsml|tool_calls>') && !after.includes('</tool_calls>') && !after.includes('</tool_call>');
 }
@@ -129,7 +143,7 @@ function normalizeDSMLToolCallMarkup(text: string): string | null {
     .replace(/<\/!\[CDATA\]>/gi, ']]>')
     .replace(/<\/!\[CDATA\[/gi, ']]>')
     .replace(/<\|DSML\|(?!tool_calls\b|invoke\b|parameter\b)([A-Za-z0-9_.:-]+)([^>]*)>/gi, '<tool_calls><invoke name="$1"$2>')
-    .replace(/<\/\|DSML\|(?!tool_calls\b|invoke\b|parameter\b)([A-Za-z0-9_.:-]+)\s*>/gi, '</invoke>')
+    .replace(/<\/\|DSML\|(?!tool_calls\b|invoke\b|parameter\b)([A-Za-z0-9_.:-]+)\s*>/gi, '</invoke></tool_calls>')
     .replace(/<\|DSML\|tool_calls([^>]*)>/gi, '<tool_calls$1>')
     .replace(/<\/\|DSML\|tool_calls\s*>/gi, '</tool_calls>')
     .replace(/<tool_call([^>]*)>/gi, '<tool_calls$1>')
@@ -226,7 +240,7 @@ function stripFencedCodeBlocks(text: string): string {
 
 function looksLikeToolCallSyntax(text: string): boolean {
   const lower = text.toLowerCase();
-  return lower.includes('tool_calls') || lower.includes('tool_call') || lower.includes('<function=') || lower.includes('<|dsml|invoke') || lower.includes('<invoke');
+  return lower.includes('tool_calls') || lower.includes('tool_call') || lower.includes('<function=') || lower.includes('<|dsml|invoke') || lower.includes('<invoke') || /<\|dsml\|[a-z0-9_.:-]+/i.test(text);
 }
 
 function extractToolMeta(tool: any) {
