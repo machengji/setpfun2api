@@ -516,7 +516,7 @@ export async function createClaudeMessage(
   system: string | undefined,
   messages: any[],
   tools: any[] | undefined,
-  authorization: string,
+  authorization = '',
   useSearch: boolean = true
 ) {
   const token = selectToken(authorization);
@@ -543,7 +543,7 @@ export async function createClaudeMessageStream(
   system: string | undefined,
   messages: any[],
   tools: any[] | undefined,
-  authorization: string,
+  authorization = '',
   useSearch: boolean = true
 ) {
   const token = selectToken(authorization);
@@ -552,11 +552,14 @@ export async function createClaudeMessageStream(
   const toolPrompt = buildToolPrompt(activeTools);
   const openaiMessages = claudeToOpenAIMessages(system, messages, toolPrompt);
   logger.info(`Claude Stream -> StepFun: model=${model} -> ${stepModel}, tools=${activeTools.length}/${tools?.length || 0}`);
+  const inputTokens = chat.estimateMessagesTokens(openaiMessages);
 
   const openaiStream = await chat.createCompletionStream(stepModel, openaiMessages, token, useSearch);
 
   const transStream = new PassThrough();
+  if (!transStream.closed) transStream.write(`: ${' '.repeat(2048)}\n\n`);
   const messageId = msgIdGen();
+  let upstreamPaused = false;
 
   let hasStarted = false;
   let hasTextBlock = false;
@@ -566,6 +569,7 @@ export async function createClaudeMessageStream(
   let sawOpenAIDone = false;
   let sawOpenAIFinishReason = false;
   const hasTools = activeTools.length > 0;
+  const toolBufferMode = hasTools && process.env.STEPFUN_CLAUDE_TOOL_BUFFER_MODE !== '0';
   const streamTimeoutMs = Number(process.env.STEPFUN_CLAUDE_STREAM_TIMEOUT_MS || 90000);
   const streamTimer = hasTools && streamTimeoutMs > 0
     ? setTimeout(() => {
@@ -578,11 +582,24 @@ export async function createClaudeMessageStream(
     : null;
   const toolSieve = createToolSieveState();
 
+  function writeClaudeSSE(eventName: string, payload: any) {
+    if (transStream.closed) return;
+    const flushed = transStream.write(`event: ${eventName}\ndata: ${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n\n: ping\n\n`);
+    if (!flushed && !upstreamPaused && typeof openaiStream.pause === 'function' && typeof openaiStream.resume === 'function') {
+      upstreamPaused = true;
+      openaiStream.pause();
+      transStream.once('drain', () => {
+        upstreamPaused = false;
+        if (!transStream.closed) openaiStream.resume();
+      });
+    }
+  }
+
   function startMessage() {
     if (hasStarted) return;
     hasStarted = true;
     if (!transStream.closed) {
-      transStream.write(`event: message_start\ndata: ${JSON.stringify({
+      writeClaudeSSE('message_start', {
         type: 'message_start',
         message: {
           id: messageId,
@@ -592,9 +609,9 @@ export async function createClaudeMessageStream(
           model,
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
+          usage: { input_tokens: inputTokens, output_tokens: 0 },
         },
-      })}\n\n`);
+      });
     }
   }
 
@@ -602,21 +619,21 @@ export async function createClaudeMessageStream(
     if (hasTextBlock) return;
     hasTextBlock = true;
     if (!transStream.closed) {
-      transStream.write(`event: content_block_start\ndata: ${JSON.stringify({
+      writeClaudeSSE('content_block_start', {
         type: 'content_block_start',
         index: 0,
         content_block: { type: 'text', text: '' },
-      })}\n\n`);
+      });
     }
   }
 
   function emitTextDelta(text: string) {
     if (!transStream.closed) {
-      transStream.write(`event: content_block_delta\ndata: ${JSON.stringify({
+      writeClaudeSSE('content_block_delta', {
         type: 'content_block_delta',
         index: 0,
         delta: { type: 'text_delta', text },
-      })}\n\n`);
+      });
     }
   }
 
@@ -632,10 +649,10 @@ export async function createClaudeMessageStream(
 
     // 关闭文本块
     if (hasTextBlock) {
-      transStream.write(`event: content_block_stop\ndata: ${JSON.stringify({
+      writeClaudeSSE('content_block_stop', {
         type: 'content_block_stop',
         index: 0,
-      })}\n\n`);
+      });
     } else if (!textBefore) {
       // 没有文本内容时也需要 start
       startMessage();
@@ -646,7 +663,7 @@ export async function createClaudeMessageStream(
     toolCalls.forEach((tc, i) => {
       logger.info(`Claude tool_use: name=${tc.name}, inputKeys=${Object.keys(tc.input || {}).join(',')}`);
       const toolBlockId = `toolu_${msgId}_${i}`;
-      transStream.write(`event: content_block_start\ndata: ${JSON.stringify({
+      writeClaudeSSE('content_block_start', {
         type: 'content_block_start',
         index: i + (hasTextBlock || textBefore ? 1 : 0),
         content_block: {
@@ -655,29 +672,30 @@ export async function createClaudeMessageStream(
           name: tc.name,
           input: {},
         },
-      })}\n\n`);
-      transStream.write(`event: content_block_delta\ndata: ${JSON.stringify({
+      });
+      writeClaudeSSE('content_block_delta', {
         type: 'content_block_delta',
         index: i + (hasTextBlock || textBefore ? 1 : 0),
         delta: {
           type: 'input_json_delta',
           partial_json: JSON.stringify(tc.input || {}),
         },
-      })}\n\n`);
-      transStream.write(`event: content_block_stop\ndata: ${JSON.stringify({
+      });
+      writeClaudeSSE('content_block_stop', {
         type: 'content_block_stop',
         index: i + (hasTextBlock || textBefore ? 1 : 0),
-      })}\n\n`);
+      });
     });
 
     // message_delta
-    transStream.write(`event: message_delta\ndata: ${JSON.stringify({
+    const toolTokens = chat.estimateTextTokens(JSON.stringify(toolCalls));
+    writeClaudeSSE('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: 'tool_use', stop_sequence: null },
-      usage: { output_tokens: 1 },
-    })}\n\n`);
+      usage: { output_tokens: toolTokens || 1 },
+    });
 
-    transStream.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
+    writeClaudeSSE('message_stop', { type: 'message_stop' });
     transStream.end();
   }
 
@@ -696,31 +714,32 @@ export async function createClaudeMessageStream(
     }
 
     if (hasTextBlock) {
-      transStream.write(`event: content_block_stop\ndata: ${JSON.stringify({
+      writeClaudeSSE('content_block_stop', {
         type: 'content_block_stop',
         index: 0,
-      })}\n\n`);
+      });
     }
 
-    transStream.write(`event: message_delta\ndata: ${JSON.stringify({
+    const outputTokens = chat.estimateTextTokens(fullText);
+    writeClaudeSSE('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: 'end_turn', stop_sequence: null },
-      usage: { output_tokens: fullText.length || 1 },
-    })}\n\n`);
+      usage: { output_tokens: outputTokens || 1 },
+    });
 
-    transStream.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
+    writeClaudeSSE('message_stop', { type: 'message_stop' });
     transStream.end();
   }
 
   function finishWithPauseTurn() {
     if (transStream.closed) return;
     startMessage();
-    transStream.write(`event: message_delta\ndata: ${JSON.stringify({
+    writeClaudeSSE('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: 'pause_turn', stop_sequence: null },
       usage: { output_tokens: 1 },
-    })}\n\n`);
-    transStream.write(`event: message_stop\ndata: {"type":"message_stop"}\n\n`);
+    });
+    writeClaudeSSE('message_stop', { type: 'message_stop' });
     transStream.end();
   }
 
@@ -730,10 +749,10 @@ export async function createClaudeMessageStream(
       startMessage();
       ensureTextBlock();
       emitTextDelta(visibleText);
-      transStream.write(`event: content_block_stop\ndata: ${JSON.stringify({
+      writeClaudeSSE('content_block_stop', {
         type: 'content_block_stop',
         index: 0,
-      })}\n\n`);
+      });
     }
     logger.warn('Claude stream contained malformed tool call syntax; returning pause_turn for retry');
     finishWithPauseTurn();
@@ -782,11 +801,13 @@ export async function createClaudeMessageStream(
   let sseBuffer = '';
 
   openaiStream.on('data', (chunk: Buffer) => {
+    if (upstreamPaused || transStream.closed) return;
     sseBuffer += chunk.toString();
     const lines = sseBuffer.split('\n');
     sseBuffer = lines.pop() || '';
 
     for (const line of lines) {
+      if (upstreamPaused || transStream.closed) break;
       if (!line.startsWith('data: ')) continue;
       const data = line.slice(6).trim();
 
@@ -803,9 +824,7 @@ export async function createClaudeMessageStream(
 
         if (content) {
           rawText += content;
-          if (hasTools) {
-            handleToolSieveEvents(processToolStreamChunk(toolSieve, content));
-          } else {
+          if (!toolBufferMode) {
             completeText += content;
             if (!hasStarted) startMessage();
             if (!hasTextBlock) ensureTextBlock();
@@ -824,16 +843,14 @@ export async function createClaudeMessageStream(
   function finalizeFromOpenAIStream() {
     if (!processed && !transStream.closed) {
       if (streamTimer) clearTimeout(streamTimer);
-      if (hasTools) {
-        handleToolSieveEvents(flushToolStream(toolSieve));
-        if (processed) return;
+      if (toolBufferMode) {
         processed = true;
-        if (!sawOpenAIDone || !sawOpenAIFinishReason) {
-          logger.warn('Claude stream ended without explicit stop; returning pause_turn');
+        if (!rawText.trim() && (!sawOpenAIDone || !sawOpenAIFinishReason)) {
+          logger.warn('Claude tool stream ended without content or stop; returning pause_turn');
           finishWithPauseTurn();
           return;
         }
-        finishWithText(completeText);
+        processCompleteText(rawText);
       } else {
         processed = true;
         if (!completeText.trim() && (!sawOpenAIDone || !sawOpenAIFinishReason)) {

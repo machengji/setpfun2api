@@ -15,6 +15,8 @@
   "scripts": {
     "dev": "tsup src/index.ts --format cjs,esm --sourcemap --dts --publicDir public --watch --onSuccess \"node --enable-source-maps dist/index.js\"",
     "dev:browser": "set STEPFUN_BROWSER_MODE=1&& tsup src/index.ts --format cjs,esm --sourcemap --dts --publicDir public --watch --onSuccess \"node --enable-source-maps dist/index.js\"",
+    "dev:anon": "set STEPFUN_ANONYMOUS_MODE=1&& tsup src/index.ts --format cjs,esm --sourcemap --dts --publicDir public --watch --onSuccess \"node --enable-source-maps dist/index.js\"",
+    "start:anon": "set STEPFUN_ANONYMOUS_MODE=1&& node --enable-source-maps dist/index.js",
     "start": "node --enable-source-maps dist/index.js",
     "build": "tsup src/index.ts --format cjs,esm --sourcemap --dts --clean --publicDir public"
   },

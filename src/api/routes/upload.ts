@@ -5,7 +5,7 @@ import FormData from 'form-data';
 
 import Request from '@/lib/request/Request.ts';
 import chat from '@/api/controllers/chat.ts';
-import { selectToken } from '@/api/middleware/auth.ts';
+import { isAnonymousModeEnabled, selectToken } from '@/api/middleware/auth.ts';
 import logger from '@/lib/logger.ts';
 
 // 与 chat.ts 中 FAKE_HEADERS 完全一致的 headers
@@ -40,13 +40,13 @@ export default {
     '/file': async (request: Request) => {
       request
         .validate('files.file', _.isObject)
-        .validate('headers.authorization', _.isString);
+      if (!isAnonymousModeEnabled()) request.validate('headers.authorization', _.isString);
 
       const files = request.files as any;
       const file = files.file;
       const fileArr = Array.isArray(file) ? file : [file];
       const firstFile = fileArr[0];
-      const refreshToken = selectToken(request.headers.authorization);
+      const refreshToken = selectToken(request.headers.authorization || '');
       const isImage = firstFile.mimetype && firstFile.mimetype.startsWith("image/");
       const uploadUrl = isImage
         ? "https://www.stepfun.com/api/resource/image"
@@ -55,7 +55,7 @@ export default {
       logger.info(`Uploading file: ${firstFile.originalFilename} (${firstFile.mimetype})`);
 
       // 通过 refreshToken 获取有效的 accessToken（与 chat.ts 中 uploadFile 一致）
-      const { deviceId, token } = await chat.acquireToken(refreshToken);
+      const auth = await chat.acquireToken(refreshToken);
 
       const fileData = await fs.readFile(firstFile.filepath);
 
@@ -80,8 +80,8 @@ export default {
         maxBodyLength: 100 * 1024 * 1024,
         timeout: 60000,
         headers: {
-          Cookie: `Oasis-Token=${token}; Oasis-Webid=${deviceId}`,
-          "Oasis-Webid": deviceId,
+          Cookie: auth.cookie || `Oasis-Token=${auth.token}; Oasis-Webid=${auth.deviceId}`,
+          "Oasis-Webid": auth.deviceId,
           Referer: "https://www.stepfun.com/chats/new",
           ...UPLOAD_HEADERS,
           ...form.getHeaders(),
@@ -122,10 +122,10 @@ export default {
     '/url': async (request: Request) => {
       request
         .validate('body.url', _.isString)
-        .validate('headers.authorization', _.isString);
+      if (!isAnonymousModeEnabled()) request.validate('headers.authorization', _.isString);
 
       const fileUrl = request.body.url;
-      const refreshToken = selectToken(request.headers.authorization);
+      const refreshToken = selectToken(request.headers.authorization || '');
 
       logger.info(`Uploading file from URL: ${fileUrl}`);
 

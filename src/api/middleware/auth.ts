@@ -2,7 +2,17 @@ import APIException from '@/lib/exceptions/APIException.ts';
 import EX from '@/api/consts/exceptions.ts';
 import { validateAdminKey, validateApiKey, getRefreshTokens } from '@/lib/auth/keys.ts';
 
+export const ANONYMOUS_TOKEN = '__stepfun_anonymous__';
+
 const tokenRoundRobinIndex = new Map<string, number>();
+
+export function isAnonymousModeEnabled(): boolean {
+  return process.env.STEPFUN_ANONYMOUS_MODE === '1' || process.env.STEPFUN_FREE_MODE === '1';
+}
+
+export function isAnonymousToken(token: string): boolean {
+  return token === ANONYMOUS_TOKEN;
+}
 
 /**
  * 从 Authorization header 解析 refresh tokens
@@ -14,8 +24,12 @@ const tokenRoundRobinIndex = new Map<string, number>();
  * @param authorization Authorization header 值
  * @returns refresh token 数组 (格式: deviceId@oasisToken)
  */
-export function resolveTokens(authorization: string): string[] {
-  const raw = authorization.replace("Bearer ", "").trim();
+export function resolveTokens(authorization = ""): string[] {
+  const raw = authorization.replace(/^Bearer\s+/i, "").trim();
+
+  if (!raw && isAnonymousModeEnabled()) {
+    return [ANONYMOUS_TOKEN];
+  }
 
   // 先尝试 API Key 查找
   const apiKeyEntry = validateApiKey(raw);
@@ -27,10 +41,10 @@ export function resolveTokens(authorization: string): string[] {
   return raw.split(",").map(t => t.trim()).filter(Boolean);
 }
 
-export function selectToken(authorization: string): string {
+export function selectToken(authorization = ""): string {
   const tokens = resolveTokens(authorization);
   if (tokens.length === 0) throw new Error('No available refresh token');
-  const raw = authorization.replace("Bearer ", "").trim();
+  const raw = authorization.replace(/^Bearer\s+/i, "").trim();
   const key = raw || tokens.join(",");
   const index = tokenRoundRobinIndex.get(key) || 0;
   tokenRoundRobinIndex.set(key, (index + 1) % tokens.length);

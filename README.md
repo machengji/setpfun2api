@@ -1,382 +1,215 @@
-# step-free-api
+# 🚀 step-free-api
 
-将 [StepFun](https://www.stepfun.com/chats/new) 网页版接口转换为 OpenAI 兼容的 API 服务。
+`step-free-api` 是一个专为追求卓越性能与稳定性的开发者设计的高性能 API 代理服务。它能够将 **StepFun (阶跃星辰)** 网页端的强大能力，零成本且优雅地转换为完全兼容 **OpenAI** 和 **Anthropic Claude** 标准协议的 API 服务。
 
-**支持特性：**
-- ✅ OpenAI Chat Completions API 兼容（`/v1/chat/completions`）
-- ✅ Claude Messages API 兼容（`/v1/messages`，可直接对接 Claude Code）
-- ✅ 流式输出（SSE）
-- ✅ 多轮对话
-- ✅ 联网搜索
-- ✅ 文件 / 图像解析
-- ✅ Function Calling / Tool Use
-- ✅ 多账号轮询 + API Key 管理
-- ✅ 浏览器模式（绕过风控）
+通过本项目，您可以无缝将 StepFun 极具性价比的超长上下文（原生长达百万字）与多模态解析能力直接接入到 **Claude Code**、**OpenClaw (CCSwitch)**、**Cherry Studio**、**LobeChat** 等各类强大的第三方客户端及智能体开发框架中。
 
 ---
 
-## 目录
+## ✨ 核心特性与技术优势
 
-- [获取 Token](#获取-token)
-- [快速启动](#快速启动)
-- [认证方式](#认证方式)
-- [API 接口](#api-接口)
-- [环境变量](#环境变量)
-- [配置文件](#配置文件)
-- [接入第三方客户端](#接入第三方客户端)
-- [实现原理](#实现原理)
-- [免责声明](#免责声明)
+为了应对高并发、大上下文的复杂生产/开发环境，本项目进行了深度的架构重构与性能打磨，具备以下独特优势：
 
----
+### 🎯 完美的协议兼容
+* **OpenAI 兼容**：完美支持 Chat Completions API (`/v1/chat/completions`)。
+* **Anthropic 兼容**：完美支持 Claude Messages API (`/v1/messages`)，可直接对接 **Claude Code** 终端编码助手。
+* **流式与多模态**：支持原生 SSE 流式打字机输出、多轮对话、Function Calling / Tool Use（工具调用）。
 
-## 获取 Token
+### ⚡ 革命性的性能与抗压设计
+* **彻底告别网络总结死锁**：放弃传统的外部大模型总结接口，改用**本地 0ms 高性能内存裁剪与智能截断**。彻底解决网络抖动或大模型总结自身挂死导致的任务排队死锁。
+* **非阻塞独立随机退避**：移除全局 Promise 串行排队锁，每个请求在高频或被风控重试时使用独立随机避退时间，彻底阻断雪崩级排队延迟。
+* **动态工具上下文原样保留**：智能重构并归档超长历史，保留最新提问后的工具链状态，彻底打破 Planner 类型智能体（如 Claude Code）因丢失上下文而陷入的工具无限重复调用死循环。
 
-1. 打开 [stepfun.com](https://www.stepfun.com/chats/new) 并登录
-2. 按 `F12` 打开浏览器开发者工具
-3. 在 **Application → Local Storage** 中找到并复制 `deviceId` 的值
-4. 在 **Application → Cookies** 中找到并复制 `Oasis-Token` 的值
-5. 将 `deviceId` 和 `Oasis-Token` 分别填写到 `config/api.json` 的对应字段中即可：
+### 🔑 零门槛匿名池（强力推荐 🌟）
+* **免账号极速使用**：内置 0 门槛免登录匿名模式，无需手动抓取 Token，开箱即用。
+* **后台预注册与账号池预热**：服务会在后台自动注册、预热并维护一个多账号轮转的匿名账号池，轮换时间为 0ms，提供极高的防封与抗压弹性。
 
-```json
-{
-  "admin_key": "your-admin-key",
-  "api_keys": {
-    "sk-your-key": {
-      "name": "账号备注",
-      "accounts": [
-        {
-          "device_id": "粘贴 deviceId 到这里",
-          "oasis_token": "粘贴 Oasis-Token 到这里"
-        }
-      ]
-    }
-  }
-}
-```
+### 📊 真实的 Token 动态计量
+* **拒绝虚假计量**：针对 OpenClaw、Cherry Studio 等客户端的 `context used` 比例显示进行了重构。
+* **高精度双语 Tokenizer**：内置高精度中英西混合 Token 测算器（中文按 `1.3 tokens/字`，英文按 `0.35 tokens/词` 实时估算），在对话时可观察到客户端的 Token 进度条灵动且极度精准地伴随实际对话增长。
 
 ---
 
-## 快速启动
+## 📅 快速启动
 
-> **注意：** 本项目需要使用**浏览器模式**才能正常对话。浏览器模式通过 Playwright 驱动真实浏览器与 StepFun 交互，非浏览器模式（直接 HTTP）目前无法正常收发消息。
+> [!IMPORTANT]
+> **运行环境要求：**
+> 1. 本项目强烈建议开启 **浏览器托管模式 (Browser Mode)**，这样可以最稳妥地规避各类网页端的高级风控与人机校验。
+> 2. 您的本地系统需要安装 **Node.js (v16+)**。
 
-### 本地运行（浏览器模式）
+### 方式 A：免登录匿名池模式 (极简推荐 ✨)
 
-```shell
+您不需要手动去抓取任何 Cookie 或 DeviceId。启动后，服务会自动使用预热池中的匿名凭证，并在过期前在后台无缝平稳轮换。
+
+```bash
+# 1. 克隆项目并安装依赖
 npm install
+
+# 2. 编译 TypeScript 代码
 npm run build
-set STEPFUN_BROWSER_MODE=1&& node dist/index.js    # Windows
-# 或
-STEPFUN_BROWSER_MODE=1 node dist/index.js          # Linux / macOS
-```
 
-### 开发模式（含热重载）
+# 3. 运行匿名免登录开发服务 (自带热重载)
+npm run dev:anon
 
-```shell
-npm run dev:browser
-```
+# 生产环境启动 (Windows PowerShell / CMD)：
+$env:STEPFUN_ANONYMOUS_MODE="1"; $env:STEPFUN_BROWSER_MODE="1"; node dist/index.js
 
-默认监听端口由 `configs/dev/service.yml` 控制（默认 `8001`）。
-
-### Docker
-
-```shell
-docker run -d --init --name step-free-api \
-  -p 8001:8001 \
-  -e STEPFUN_BROWSER_MODE=1 \
-  vinlic/step-free-api:latest
-```
-
-> Docker 镜像需包含 Playwright 浏览器依赖，请确认镜像版本支持浏览器模式。
-
-### 验证服务
-
-```shell
-curl http://localhost:8001/ping
-# 返回 "pong"
+# 生产环境启动 (Linux / macOS)：
+STEPFUN_ANONYMOUS_MODE=1 STEPFUN_BROWSER_MODE=1 node dist/index.js
 ```
 
 ---
 
-## 认证方式
+### 方式 B：配置自有账号模式 (适合多账号轮询与持久会话)
 
-所有接口均通过 `Authorization` 请求头传入凭证。
+如果您希望使用自己注册的 StepFun 官方账号以保留云端历史或获取更高的额度：
 
-### 推荐方式：编辑 config/api.json（直接配置）
+1. 打开并登录 [StepFun 官网](https://www.stepfun.com/chats/new) 网页端。
+2. 按下 `F12` 打开浏览器开发者工具，进入 **Application (应用) → Cookies** 复制 `Oasis-Token`；并在 **Local Storage (本地存储)** 中复制 `deviceId`。
+3. 手动编辑或创建项目根目录下的 `config/api.json`，格式如下：
+   ```json
+   {
+     "admin_key": "your-admin-key",
+     "api_keys": {
+       "sk-stepfun-pro": {
+         "name": "我的主账号",
+         "accounts": [
+           {
+             "device_id": "抓取的 deviceId",
+             "oasis_token": "抓取的 Oasis-Token"
+           }
+         ]
+       }
+     }
+   }
+   ```
+4. 启动服务：
+   ```bash
+   npm run dev:browser
+   ```
 
-在 `config/api.json` 中填写账号信息和 API Key：
+---
 
+## ⚙️ 环境变量配置手册
+
+您可以通过创建 `.env` 文件或在启动脚本中注入以下环境变量来深度定制服务表现：
+
+| 环境变量 | 作用与配置说明 | 默认值 |
+| :--- | :--- | :--- |
+| `SERVER_PORT` | 服务监听的本地端口。 | `8000` |
+| `SERVER_HOST` | 服务绑定的主机地址。 | `0.0.0.0` |
+| `STEPFUN_BROWSER_MODE` | 设定为 `1` 时启用 Playwright 浏览器托管，以完美规避风控。 | `未设置` |
+| `STEPFUN_ANONYMOUS_MODE` | 设定为 `1` 时开启免账号匿名池模式。 | `未设置` |
+| `STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS` | **上下文压缩/文件化起征字符数**。只有当历史会话达到该长度时，才会触发云端文件归档，从而最大程度榨干 StepFun 原生超大上下文的实力。 | `200000` (约 200k 字符) |
+| `STEPFUN_CURRENT_INPUT_LIVE_MAX_CHARS` | 单次交互中允许的最大活跃上下文截断上限。 | `8000` |
+| `STEPFUN_CURRENT_INPUT_SUMMARY_MAX_CHARS` | 内存中本地 0-ms 裁剪的最大摘要字符数。 | `8000` |
+| `STEPFUN_CONVERSATION_CREATE_MIN_DELAY_MS` | 创建新对话的最小避让随机间隔（毫秒）。 | `1000` |
+| `STEPFUN_CONVERSATION_CREATE_MAX_DELAY_MS` | 创建新对话的最大避让随机间隔（毫秒）。 | `3000` |
+| `STEPFUN_STREAM_TIMEOUT_MS` | 单次网络请求超时阈值，超时后启动智能自愈。 | `60000` (60秒) |
+
+---
+
+## 🔌 接入主流第三方客户端
+
+### 1. OpenClaw (CCSwitch) 接入配置
+1. 打开 OpenClaw 客户端，进入 **设置** → **供应商配置** → **添加供应商**。
+2. **填写基本配置**：
+   * **API 协议**：选择 `OpenAI Completions`。
+   * **API 端点**：填入 `http://localhost:8000/v1`（具体以您配置的端口为准）。
+   * **API Key**：填入您在 `api.json` 中配置的 API Key（匿名免登录模式下可填写任意字符串，如 `sk-free-anon`）。
+3. **添加模型 ID**：在供应商的模型列表中添加以下任意模型，所有模型在底层均自动映射至 StepFun 核心引擎：
+   * `step-v1` / `step-v1-vision`（推荐）
+   * `claude-3-5-sonnet-latest`（用于直接欺骗需要 Claude 协议的客户端）
+
+> [!TIP]
+> **关于 Token 仪表盘：**
+> 接入成功后，当您与模型对话时，OpenClaw 的 Token 进度条会随历史对话的真实累积字数进行平滑、精准的变动，这得益于我们内置的中英双语高精度 Token 测算估算器。
+
+---
+
+### 2. Claude Code 接入配置
+如果您希望使用 Anthropic 官方的命令行编码神器 **Claude Code**，可以使用本项目进行完美的免费桥接：
+
+```bash
+# 在终端中启动 Claude Code 并将其指向本代理服务的兼容端点：
+claude --api-url http://localhost:8000
+```
+> 本代理会将 Claude 发送的特定消息结构体完美映射，并智能保存 Tool Use 上下文，带给您流畅的免费终端编码体验。
+
+---
+
+## 🛠️ API 规范与使用示例
+
+### 1. 标准文本对话 (OpenAI 风格)
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-free-anon" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "step-v1",
+    "messages": [{"role": "user", "content": "请用 50 字解释量子纠缠的物理本质。"}],
+    "stream": true
+  }'
+```
+
+### 2. 多模态文件与图像解析
+StepFun 支持极为强大的文档及多模态解析能力。您可以在 `messages` 的 `content` 数组中轻松传递远程 PDF 报告、Office 文档或图像：
 ```json
 {
-  "admin_key": "your-admin-key",
-  "api_keys": {
-    "sk-your-key": {
-      "name": "账号备注",
-      "accounts": [
+  "model": "step-v1",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
         {
-          "device_id": "你的deviceId",
-          "oasis_token": "你的Oasis-Token"
+          "type": "file",
+          "file_url": {
+            "url": "https://example.com/financial_report.pdf"
+          }
+        },
+        {
+          "type": "text",
+          "text": "总结这份财务报表的核心财务指标，并列出风险点。"
         }
       ]
     }
-  }
-}
-```
-
-填好后调用接口时直接使用：
-
-```
-Authorization: Bearer sk-your-key
-```
-
-多账号只需在 `accounts` 数组中添加多个对象，服务会自动轮询。
-
----
-
-## API 接口
-
-### POST /v1/chat/completions
-
-兼容 OpenAI [Chat Completions API](https://platform.openai.com/docs/guides/text-generation/chat-completions-api)。
-
-```shell
-curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "step",
-    "messages": [{"role": "user", "content": "你好"}],
-    "stream": false
-  }'
-```
-
-**支持参数：**
-
-| 参数 | 说明 |
-|------|------|
-| `model` | 模型名，填 `step` 或 `step-v1` 即可 |
-| `messages` | 对话历史，兼容 OpenAI 格式 |
-| `stream` | `true` 启用 SSE 流式输出 |
-| `tools` | Function Calling 工具定义（OpenAI 格式） |
-| `use_search` | `false` 关闭联网搜索（默认开启） |
-
-**文件 / 图像解析：**
-
-在 `content` 中传入多模态内容：
-
-```json
-{
-  "model": "step",
-  "messages": [{
-    "role": "user",
-    "content": [
-      {"type": "file", "file_url": {"url": "https://example.com/doc.pdf"}},
-      {"type": "text", "text": "总结这份文档"}
-    ]
-  }]
-}
-```
-
-也兼容 OpenAI `image_url` 格式传图片。
-
----
-
-### POST /v1/messages
-
-兼容 Anthropic [Messages API](https://docs.anthropic.com/en/api/messages)，可直接对接 **Claude Code** 等工具。
-
-支持的 Claude 模型别名（均映射至 `step-v1`）：
-
-| 别名 | 映射 |
-|------|------|
-| `claude-sonnet-4-5 / 4-6 / 4-7` | `step-v1` |
-| `claude-opus-4-5 / 4-6 / 4-7` | `step-v1` |
-| `claude-haiku-4-5` | `step-v1` |
-| `claude-3-5-sonnet-latest` | `step-v1` |
-
-```shell
-curl http://localhost:8000/v1/messages \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "claude-sonnet-4-6",
-    "messages": [{"role": "user", "content": "你好"}],
-    "max_tokens": 1024
-  }'
-```
-
----
-
-### GET /v1/models
-
-返回可用模型列表。
-
----
-
-### POST /v1/upload/file
-
-上传本地文件至 StepFun，获取文件 URL 用于后续对话引用。
-
-```shell
-curl http://localhost:8000/v1/upload/file \
-  -H "Authorization: Bearer YOUR_TOKEN" \
-  -F "file=@/path/to/document.pdf"
-```
-
-### POST /v1/upload/url
-
-通过远程 URL 上传文件。
-
-```json
-{ "url": "https://example.com/document.pdf" }
-```
-
----
-
-### POST /token/check
-
-检测 refresh_token 是否仍有效。
-
-```json
-{ "token": "deviceId@Oasis-Token" }
-```
-
-响应：
-
-```json
-{ "live": true }
-```
-
----
-
-## 环境变量
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `SERVER_PORT` | 服务监听端口 | `8000` |
-| `SERVER_HOST` | 服务监听地址 | `0.0.0.0` |
-| `SERVER_ENV` | 运行环境（对应 `configs/` 下目录名） | `dev` |
-| `STEPFUN_BROWSER_MODE` | 设为 `1` 启用浏览器模式 | 未设置 |
-| `STEPFUN_ALLOW_AGENT_TOOLS` | 设为 `1` 允许 agent/explore 工具 | 未设置 |
-| `STEPFUN_STREAM_TIMEOUT_MS` | 浏览器流式响应超时时间，超时后会重新创建对话并要求简单回复 | `60000` |
-| `STEPFUN_STREAM_TIMEOUT_RETRY_COUNT` | 浏览器流式响应超时重试次数 | `1` |
-| `STEPFUN_STREAM_TIMEOUT_RETRY_PROMPT` | 超时重试时追加的简短回复提示词 | `请简单回复，避免长时间思考或循环。` |
-| `STEPFUN_CHINESE_REPLY_PROMPT` | 默认追加的中文回复提示词 | 强制中文回复，并避免误判 `DS2API_HISTORY.txt` 为空 |
-| `STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS` | 历史记录写入文件的最小字符数 | `0` |
-| `STEPFUN_CURRENT_INPUT_LIVE_MAX_CHARS` | 历史记录文件最大字符数 | `20000` |
-| `STEPFUN_CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS` | 历史上下文超过该字符数时请求模型压缩总结 | `200000` |
-| `STEPFUN_CURRENT_INPUT_SUMMARY_MAX_CHARS` | 压缩总结后的最大字符数 | `40000` |
-| `STEPFUN_CONVERSATION_CREATE_MIN_DELAY_MS` | 创建会话最小间隔（ms） | `1000` |
-| `STEPFUN_CONVERSATION_CREATE_MAX_DELAY_MS` | 创建会话最大间隔（ms） | `3000` |
-
----
-
-## 配置文件
-
-### configs/{env}/service.yml
-
-服务监听配置：
-
-```yaml
-name: step-free-api
-host: '0.0.0.0'
-port: 8000
-```
-
-### configs/{env}/system.yml
-
-系统行为配置：
-
-```yaml
-requestLog: false      # 是否打印每条请求日志
-tmpDir: ./tmp          # 临时文件目录
-logDir: ./logs         # 日志目录
-tmpFileExpires: 86400000  # 临时文件有效期（ms）
-```
-
-### config/api.json
-
-API Key 与账号信息配置文件，直接手动编辑即可：
-
-```json
-{
-  "admin_key": "your-admin-key",
-  "api_keys": {
-    "sk-example": {
-      "name": "示例账号",
-      "accounts": [
-        {"device_id": "xxx", "oasis_token": "yyy"}
-      ]
-    }
-  }
+  ]
 }
 ```
 
 ---
 
-## 接入第三方客户端
+## 🎯 系统架构与设计原理
 
-### CCSwitch
+下面是系统的核心运转与设计逻辑示意图：
 
-1. 打开 CCSwitch → **设置** → **供应商配置** → **添加供应商**
-
-   ![CCSwitch 供应商配置](docs/openclaw-setup.png)
-
-2. 填写以下信息：
-
-   | 字段 | 值 |
-   |------|-----|
-   | **API 协议** | `OpenAI Completions` |
-   | **API 端点** | `http://localhost:8001/v1` |
-   | **API Key** | 你的 Token 或已创建的 API Key（如 `sk-stepfun-pro`） |
-
-3. 在 **模型列表** 中点击 **添加模型**，**模型 ID** 可填写以下任意一个：
-
-   | 模型 ID | 说明 |
-   |---------|------|
-   | `step-v1` | 原生模型名 |
-   | `step-v1-vision` | 原生模型名（视觉） |
-   | `claude-opus-4-5` / `claude-opus-4-6` / `claude-opus-4-7` | Claude Opus 别名 |
-   | `claude-sonnet-4-5` / `claude-sonnet-4-6` / `claude-sonnet-4-7` | Claude Sonnet 别名 |
-   | `claude-haiku-4-5` | Claude Haiku 别名 |
-   | `claude-3-5-sonnet-latest` | Claude 3.5 Sonnet 别名 |
-   | `claude-3-opus-latest` | Claude 3 Opus 别名 |
-
-   > 所有 Claude 别名均映射到 `step-v1`，填哪个效果相同，按需选择即可。
-
-4. 保存后即可在对话界面选择该供应商和模型使用。
-
-> **配置 JSON 示例（供参考）：**
-> ```json
-> {
->   "api": "openai-completions",
->   "apiKey": "sk-stepfun-pro",
->   "baseUrl": "http://localhost:8001/v1",
->   "models": [
->     {
->       "id": "claude-opus-4-6"
->     }
->   ]
-> }
-> ```
+```mermaid
+graph TD
+    Client["💻 第三方客户端 <br/> (Claude Code / OpenClaw / Cherry Studio)"] 
+    -->|标准 OpenAI / Claude 协议| Proxy["🚀 step-free-api 核心代理层"]
+    
+    subgraph ProxyFeatures ["⚡ 核心优化与特性引擎"]
+        Account["🔑 账号管理 <br/> 匿名免登录预温池 <br/> (多账号热备 / 0ms 无感知轮换)"]
+        Perf["⚡ 性能与高可用 <br/> 0ms 本地内存裁剪 <br/> (并发独立随机避退 / 拒绝死锁)"]
+        Context["📦 上下文归档 <br/> 历史还原净化 (Scrubbing) <br/> (动态工具链状态原样保留)"]
+        Token["📊 Token 计量器 <br/> 中英西三语高精度流式估算 <br/> (实时更新 Client 进度条)"]
+    end
+    
+    Proxy --> Account
+    Proxy --> Perf
+    Proxy --> Context
+    Proxy --> Token
+    
+    Account -->|Playwright 托管 / Protobuf 协议事件流| StepFun["🌐 StepFun 官方网页端服务"]
+    Perf --> StepFun
+    Context --> StepFun
+    Token --> StepFun
+```
 
 ---
 
-## 实现原理
+## ⚖️ 免责声明
 
-本项目是一个 **API 代理层**，将 StepFun 网页端内部接口封装为标准 OpenAI / Anthropic API 格式：
-
-1. **认证** — 使用 `deviceId` + `Oasis-Token` 调用 StepFun 的 RefreshToken 接口，换取有效期内的 `access_token`（缓存 15 分钟）
-2. **会话** — 每次请求创建临时对话会话，对话结束后自动清理
-3. **流式响应** — 对接 StepFun 的 protobuf 流式接口，实时转换为 SSE 格式返回
-4. **多轮对话** — 将历史消息序列化为文件上传，以此实现上下文传递
-5. **工具调用** — 通过 DSML 标签将工具描述注入提示词，解析模型输出并还原为 OpenAI `tool_calls` / Anthropic `tool_use` 格式
-6. **浏览器模式** — 使用 Playwright 驱动真实浏览器进行交互，用于规避风控
-
----
-
-## 免责声明
-
-- 本项目仅供学习与技术研究，请勿用于任何商业或违法用途
-- 使用本项目造成的任何后果由使用者自行承担
-- 本项目与 阶跃星辰 无任何关联
+* 本项目仅供学术研究、个人学习以及技术探索之用，请勿用于任何商业利益目的或非法途径。
+* 网页端接口在未来可能发生非预期的改动、封禁或限制，使用本项目可能产生的账号风控等相关风险及责任需由使用者本人自行承担。
+* 本项目与 阶跃星辰 (StepFun) 官方无任何商业关联。

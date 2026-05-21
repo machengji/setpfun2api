@@ -18,6 +18,7 @@ const startupTime = performance.now();
   logger.info("Environment:", environment.env);
   logger.info("Service name:", config.service.name);
   logger.info("StepFun browser mode:", process.env.STEPFUN_BROWSER_MODE === "1" ? "enabled" : "disabled");
+  logger.info("StepFun anonymous mode:", (process.env.STEPFUN_ANONYMOUS_MODE === "1" || process.env.STEPFUN_FREE_MODE === "1") ? "enabled" : "disabled");
 
   server.attachRoutes(routes);
   await server.listen();

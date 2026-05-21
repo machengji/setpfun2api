@@ -21,6 +21,7 @@ import APIException from "@/lib/exceptions/APIException.ts";
 import EX from "@/api/consts/exceptions.ts";
 import logger from "@/lib/logger.ts";
 import util from "@/lib/util.ts";
+import { isAnonymousToken } from "@/api/middleware/auth.ts";
 
 // 模型名称
 const MODEL_NAME = "step";
@@ -51,43 +52,274 @@ const FAKE_HEADERS = {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
   "X-Waf-Client-Type": "fetch_sdk"
 };
+const ANONYMOUS_HEADERS = {
+  Accept: "*/*",
+  "Accept-Encoding": "gzip, deflate",
+  "Accept-Language": "zh-CN,zh-Hans;q=0.9",
+  Origin: "https://www.stepfun.com",
+  "Connect-Protocol-Version": "1",
+  "Oasis-Appid": "10200",
+  "Oasis-Language": "zh",
+  "Oasis-Platform": "web",
+  "Canary": "false",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-origin",
+  "User-Agent":
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/136.0.7103.91 Mobile/15E148 Safari/604.1",
+  "X-Waf-Client-Type": "fetch_sdk"
+};
+const ANONYMOUS_BASE_COOKIE = "is_pc_desktop=false; i18next=zh";
+const ANONYMOUS_IDENTITY_TTL_MS = Number(process.env.STEPFUN_ANONYMOUS_IDENTITY_TTL_MS || 30 * 60 * 1000);
+const ANONYMOUS_ROTATE_AFTER = Number(process.env.STEPFUN_ANONYMOUS_ROTATE_AFTER || 3);
 // 文件最大大小
 const FILE_MAX_SIZE = 100 * 1024 * 1024;
 // access_token映射
 const accessTokenMap = new Map();
 // access_token请求队列映射
 const accessTokenRequestQueueMap: Record<string, Function[]> = {};
-const browserStateMap = new Map<string, { context: BrowserContext; page: Page | null; chatSessionId: string | null }>();
+const browserStateMap = new Map<string, { context: BrowserContext; page: Page | null; chatSessionId: string | null; deviceId?: string }>();
 let browserStreamId = 0;
+export type StepFunAuth = { deviceId: string; token: string; cookie?: string; anonymous?: boolean };
+type AnonymousIdentity = StepFunAuth & { turns: number; createdAt: number; ingressCookie?: string };
+let anonymousIdentity: AnonymousIdentity | null = null;
+const ANONYMOUS_POOL_SIZE = 3;
+const anonymousIdentityPool: AnonymousIdentity[] = [];
+let anonymousPoolReplenishing = false;
 const CURRENT_INPUT_FILENAME = "DS2API_HISTORY.txt";
 const CURRENT_INPUT_CONTENT_TYPE = "text/plain; charset=utf-8";
-const CURRENT_INPUT_MIN_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS || 0);
-const CURRENT_INPUT_LIVE_MAX_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_LIVE_MAX_CHARS || 20000);
-const CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS || 200000);
-const CURRENT_INPUT_SUMMARY_MAX_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_SUMMARY_MAX_CHARS || 40000);
+// Explicación: Cambiamos el valor por defecto de CURRENT_INPUT_MIN_CHARS de 8000 a 200000 (200k) según la solicitud del usuario. Esto permite que el historial de chat se transmita directamente de forma nativa sin comprimirse ni adjuntarse hasta que alcance los 200,000 caracteres, aprovechando al máximo la gran capacidad de contexto del modelo.
+const CURRENT_INPUT_MIN_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS || 200000);
+const CURRENT_INPUT_LIVE_MAX_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_LIVE_MAX_CHARS || 8000);
+const CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS || 15000);
+const CURRENT_INPUT_SUMMARY_MAX_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_SUMMARY_MAX_CHARS || 8000);
 const CONVERSATION_CREATE_MIN_DELAY_MS = Number(process.env.STEPFUN_CONVERSATION_CREATE_MIN_DELAY_MS || 1000);
 const CONVERSATION_CREATE_MAX_DELAY_MS = Number(process.env.STEPFUN_CONVERSATION_CREATE_MAX_DELAY_MS || 3000);
 const STREAM_TIMEOUT_MS = Number(process.env.STEPFUN_STREAM_TIMEOUT_MS || 60000);
 const STREAM_TIMEOUT_RETRY_COUNT = Number(process.env.STEPFUN_STREAM_TIMEOUT_RETRY_COUNT || 1);
 const STREAM_TIMEOUT_RETRY_PROMPT = process.env.STEPFUN_STREAM_TIMEOUT_RETRY_PROMPT || "请简单回复，避免长时间思考或循环。";
 const CHINESE_REPLY_PROMPT = process.env.STEPFUN_CHINESE_REPLY_PROMPT || "除非用户明确要求其他语言，否则必须使用简体中文回复。如果上下文提到 DS2API_HISTORY.txt，但附件不可读或未展示完整正文，请使用消息中可见的内联 Context，不要断言该文件为空。";
-let conversationCreateNextAt = 0;
-let conversationCreateThrottleQueue = Promise.resolve();
+let lastConversationCreateAt = 0;
+
+function logPrompt(content: string) {
+  logger.info(`[${new Date().toISOString()}] 提示词：\n${content}`);
+}
 
 async function throttleConversationCreate() {
-  conversationCreateThrottleQueue = conversationCreateThrottleQueue.then(async () => {
-    const now = Date.now();
-    const waitMs = Math.max(0, conversationCreateNextAt - now);
-    if (waitMs > 0) {
-      logger.info(`Wait ${waitMs}ms before creating StepFun conversation`);
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
+  // Explicación: Para evitar el bloqueo global y el encolamiento infinito de solicitudes (que provoca una sensación de bucle infinito y bloquea todas las peticiones concurrentes en cola), reemplazamos la cadena de Promise global por un control de intervalo de tiempo simple y local. Esto evita colas largas acumuladas y la inactividad del hilo de ejecución.
+  const now = Date.now();
+  const minDelay = Math.max(0, Math.min(CONVERSATION_CREATE_MIN_DELAY_MS, CONVERSATION_CREATE_MAX_DELAY_MS));
+  const maxDelay = Math.max(minDelay, Math.max(CONVERSATION_CREATE_MIN_DELAY_MS, CONVERSATION_CREATE_MAX_DELAY_MS));
+  const randomDelay = minDelay + Math.floor(Math.random() * (maxDelay - minDelay + 1));
+
+  const elapsed = now - lastConversationCreateAt;
+  if (elapsed < randomDelay) {
+    const waitMs = randomDelay - elapsed;
+    logger.info(`[频率限制] 距离上次创建会话仅过去 ${elapsed}ms，本请求独立避让等待 ${waitMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+  }
+  lastConversationCreateAt = Date.now();
+}
+
+function getSetCookieValues(headers: any): string[] {
+  const value = headers?.["set-cookie"];
+  if (!value) return [];
+  return Array.isArray(value) ? value : [String(value)];
+}
+
+function extractSetCookieValue(headers: any, name: string) {
+  for (const item of getSetCookieValues(headers)) {
+    const [pair] = item.split(";");
+    const eq = pair.indexOf("=");
+    if (eq <= 0) continue;
+    if (pair.slice(0, eq).trim().toLowerCase() === name.toLowerCase()) return pair.slice(eq + 1);
+  }
+  return "";
+}
+
+function generateAnonymousCookie(identity: { deviceId: string; token: string; ingressCookie?: string }) {
+  return [
+    ANONYMOUS_BASE_COOKIE,
+    `Oasis-Token=${identity.token}`,
+    `Oasis-Webid=${identity.deviceId}`,
+    identity.ingressCookie ? `INGRESSCOOKIE=${identity.ingressCookie}` : "",
+  ].filter(Boolean).join("; ");
+}
+
+function shouldRenewAnonymousIdentity(identity: AnonymousIdentity | null) {
+  if (!identity) return true;
+  const elapsed = Date.now() - identity.createdAt;
+  const isExpired = ANONYMOUS_IDENTITY_TTL_MS > 0 && elapsed > ANONYMOUS_IDENTITY_TTL_MS;
+  const isTurnsExceeded = ANONYMOUS_ROTATE_AFTER > 0 && identity.turns >= ANONYMOUS_ROTATE_AFTER;
+  if (isExpired || isTurnsExceeded) {
+    logger.info(`[匿名凭据生命周期] 凭据需刷新。原因: 过期=${isExpired} (已用时间=${elapsed}ms), 轮转数超限=${isTurnsExceeded} (当前使用轮次=${identity.turns}/${ANONYMOUS_ROTATE_AFTER})`);
+    return true;
+  }
+  return false;
+}
+
+// Explicación: Se agregan registros detallados de depuración aquí para identificar por qué la sesión anónima se congela o falla durante el registro del dispositivo en StepFun.
+async function registerAnonymousIdentity() {
+  logger.info(`[匿名凭据注册] 正在发送 RegisterDevice 请求至 StepFun 进行匿名注册...`);
+  const startTime = Date.now();
+  try {
+    const result = await axios.post(
+      "https://www.stepfun.com/passport/proto.api.passport.v1.PassportService/RegisterDevice",
+      "{}",
+      {
+        headers: {
+          ...ANONYMOUS_HEADERS,
+          "Content-Type": "application/json",
+          Cookie: ANONYMOUS_BASE_COOKIE,
+          Referer: "https://www.stepfun.com/chats/new",
+        },
+        timeout: 30000,
+        validateStatus: () => true,
+      }
+    );
+    const duration = Date.now() - startTime;
+    logger.info(`[匿名凭据注册] 接口响应完成，耗时=${duration}ms, HTTP 状态码=${result.status}`);
+
+    if (result.status >= 400) {
+      logger.error(`[匿名凭据注册] 注册接口 HTTP 错误: 状态码=${result.status}, 响应体=${JSON.stringify(result.data).substring(0, 1000)}`);
+      throw new APIException(EX.API_REQUEST_FAILED, `[匿名注册step失败]: HTTP ${result.status}`);
     }
-    const min = Math.max(0, Math.min(CONVERSATION_CREATE_MIN_DELAY_MS, CONVERSATION_CREATE_MAX_DELAY_MS));
-    const max = Math.max(min, Math.max(CONVERSATION_CREATE_MIN_DELAY_MS, CONVERSATION_CREATE_MAX_DELAY_MS));
-    const delay = min + Math.floor(Math.random() * (max - min + 1));
-    conversationCreateNextAt = Date.now() + delay;
+    if (result.data?.code) {
+      logger.error(`[匿名凭据注册] 接口返回业务错误代码: code=${result.data.code}, message=${result.data.message}`);
+      throw new APIException(EX.API_REQUEST_FAILED, `[匿名注册step失败]: ${result.data.message || result.data.code}`);
+    }
+
+    const deviceId = result.data?.device?.deviceID || extractSetCookieValue(result.headers, "Oasis-Webid");
+    const token = extractSetCookieValue(result.headers, "Oasis-Token") || result.data?.token?.raw || result.data?.refreshToken?.raw || result.data?.accessToken?.raw;
+    const ingressCookie = extractSetCookieValue(result.headers, "INGRESSCOOKIE");
+
+    if (!deviceId || !token) {
+      logger.error(`[匿名凭据注册] 未能从响应中提取凭据: deviceId=${!!deviceId}, token=${!!token}, headers=${JSON.stringify(result.headers)}`);
+      throw new APIException(EX.API_REQUEST_FAILED, `[匿名注册step失败]: StepFun 未返回匿名凭据`);
+    }
+
+    const identity: AnonymousIdentity = {
+      deviceId,
+      token,
+      ingressCookie,
+      turns: 0,
+      createdAt: Date.now(),
+      anonymous: true,
+    };
+    identity.cookie = generateAnonymousCookie(identity);
+    logger.success(`[匿名凭据注册] StepFun 匿名身份注册成功: deviceId=${deviceId.substring(0, 16)}..., ingressCookie=${!!ingressCookie}`);
+    return identity;
+  } catch (error: any) {
+    logger.error(`[匿名凭据注册] 请求出现异常: ${error.message}`, error);
+    throw error;
+  }
+}
+
+// Explicación: Esta función repone de forma asíncrona el grupo de identidades anónimas para evitar bloqueos por registro lento al cambiar de cuenta.
+async function replenishAnonymousPool() {
+  if (anonymousPoolReplenishing) return;
+  anonymousPoolReplenishing = true;
+  try {
+    while (anonymousIdentityPool.length < ANONYMOUS_POOL_SIZE) {
+      logger.info(`[匿名凭据池] 当前池内账号数=${anonymousIdentityPool.length}/${ANONYMOUS_POOL_SIZE}，正在异步注册新凭证补充...`);
+      try {
+        const identity = await registerAnonymousIdentity();
+        anonymousIdentityPool.push(identity);
+        logger.success(`[匿名凭据池] 成功补充一个凭证到池中，当前池内账号数=${anonymousIdentityPool.length}`);
+      } catch (err: any) {
+        logger.error(`[匿名凭据池] 异步注册凭证失败: ${err.message}. 5秒后重试...`);
+        await new Promise(resolve => setTimeout(resolve, 5000));
+      }
+    }
+  } finally {
+    anonymousPoolReplenishing = false;
+  }
+}
+
+// Explicación: Adquiere una identidad anónima del grupo pre-registrado para una respuesta instantánea sin esperar el registro de red.
+async function acquireAnonymousIdentity(force = false) {
+  logger.info(`[匿名凭据调度] 准备获取匿名凭证... 强制更新=${force}`);
+  if (!force && anonymousIdentity && !shouldRenewAnonymousIdentity(anonymousIdentity)) {
+    logger.info(`[匿名凭据调度] 复用当前有效匿名凭证: deviceId=${anonymousIdentity.deviceId.substring(0, 16)}...`);
+    return anonymousIdentity;
+  }
+  if (force && anonymousIdentity) {
+    logger.warn(`[匿名凭据调度] 强制弃用当前身份: deviceId=${anonymousIdentity.deviceId.substring(0, 16)}...`);
+    anonymousIdentity = null;
+  }
+  while (anonymousIdentityPool.length > 0) {
+    const nextIdentity = anonymousIdentityPool.shift()!;
+    if (!shouldRenewAnonymousIdentity(nextIdentity)) {
+      anonymousIdentity = nextIdentity;
+      logger.success(`[匿名凭据调度] 从预热池中成功取出有效匿名凭据: deviceId=${anonymousIdentity.deviceId.substring(0, 16)}...`);
+      replenishAnonymousPool().catch(err => {
+        logger.error(`[匿名凭据调度] 补充账号池发生异常: ${err.message}`);
+      });
+      return anonymousIdentity;
+    } else {
+      logger.warn(`[匿名凭据调度] 从池中取出的凭据已过期，舍弃: deviceId=${nextIdentity.deviceId.substring(0, 16)}...`);
+    }
+  }
+  logger.warn(`[匿名凭据调度] 预热池为空！正在同步发起设备注册进行兜底...`);
+  const newIdentity = await registerAnonymousIdentity();
+  anonymousIdentity = newIdentity;
+  replenishAnonymousPool().catch(err => {
+    logger.error(`[匿名凭据调度] 补充账号池发生异常: ${err.message}`);
   });
-  return conversationCreateThrottleQueue;
+  return anonymousIdentity;
+}
+
+function clearAnonymousIdentity(auth?: StepFunAuth) {
+  if (!auth) {
+    logger.warn(`[匿名凭据生命周期] 清空所有匿名凭证`);
+    anonymousIdentity = null;
+    return;
+  }
+  if (!anonymousIdentity) return;
+  if (anonymousIdentity.deviceId === auth.deviceId) {
+    logger.warn(`[匿名凭据生命周期] 清空失效的匿名凭证: deviceId=${auth.deviceId.substring(0, 16)}...`);
+    anonymousIdentity = null;
+  }
+}
+
+function reserveAnonymousTurn(auth: StepFunAuth) {
+  if (!auth.anonymous || !anonymousIdentity || anonymousIdentity.deviceId !== auth.deviceId) return;
+  anonymousIdentity.turns += 1;
+  logger.info(`[匿名凭据生命周期] 匿名账号计数增加，当前使用轮次=${anonymousIdentity.turns}`);
+}
+
+async function acquireStepFunAuth(refreshToken: string): Promise<StepFunAuth> {
+  if (isAnonymousToken(refreshToken)) return acquireAnonymousIdentity();
+  return acquireToken(refreshToken);
+}
+
+function getStepFunHeaders(auth: StepFunAuth, referer: string, contentType: string) {
+  return {
+    "Content-Type": contentType,
+    Cookie: auth.cookie || generateCookie(auth.deviceId, auth.token),
+    "Oasis-Webid": auth.deviceId,
+    "Canary": false,
+    Referer: referer,
+    ...(auth.anonymous ? ANONYMOUS_HEADERS : FAKE_HEADERS),
+  };
+}
+
+function isNeedSignInError(err: any) {
+  if (!err) return false;
+  if (err.code === "permission_denied") return true;
+  const message = String(err.message || "").toLowerCase();
+  if (message.includes("need sign in")) return true;
+  return (err.details || []).some((detail: any) => detail?.debug?.code === "CODE_ACCOUNT_NEED_SIGN_IN");
+}
+
+function isNeedSignInAnswer(answer: any) {
+  if (isNeedSignInError(answer?.__stepFunError)) return true;
+  const text = String(answer?.choices?.[0]?.message?.content || "");
+  return /permission_denied|need sign in|CODE_ACCOUNT_NEED_SIGN_IN/i.test(text);
+}
+
+function attachStepFunError(target: any, error: any) {
+  Object.defineProperty(target, "__stepFunError", { value: error, configurable: true });
 }
 
 /**
@@ -103,11 +335,8 @@ async function requestToken(refreshToken: string) {
       accessTokenRequestQueueMap[refreshToken].push(resolve)
     );
   accessTokenRequestQueueMap[refreshToken] = [];
-  logger.info(`Refresh token: ${refreshToken}`);
   const result = await (async () => {
     const [deviceId, token] = refreshToken.split("@");
-    const cookie = `Oasis-Token=${token.substring(0, 50)}...${token.substring(token.length - 20)}`;
-    logger.info(`[DEBUG] RefreshToken request: deviceId=${deviceId}, cookie=${cookie}`);
     const result = await axios.post(
       "https://www.stepfun.com/passport/proto.api.passport.v1.PassportService/RefreshToken",
       {},
@@ -122,7 +351,6 @@ async function requestToken(refreshToken: string) {
         validateStatus: () => true,
       }
     );
-    logger.info(`Refresh token response status=${result.status}, data=${JSON.stringify(result.data).substring(0, 300)}`);
     const {
       accessToken: { raw: accessTokenRaw },
       refreshToken: { raw: refreshTokenRaw },
@@ -134,7 +362,6 @@ async function requestToken(refreshToken: string) {
       try {
         const payload = JSON.parse(Buffer.from(accessTokenParts[1], "base64").toString());
         accessTokenExp = new Date(payload.exp * 1000).toISOString();
-        logger.info(`[DEBUG] accessToken JWT exp=${accessTokenExp}, code TTL=${ACCESS_TOKEN_EXPIRES}s`);
       } catch (_) {}
     }
     return {
@@ -151,7 +378,6 @@ async function requestToken(refreshToken: string) {
         );
         delete accessTokenRequestQueueMap[refreshToken];
       }
-      logger.success(`Refresh successful`);
       return result;
     })
     .catch((err) => {
@@ -174,17 +400,14 @@ async function requestToken(refreshToken: string) {
  *
  * @param refreshToken 用于刷新access_token的refresh_token
  */
-async function acquireToken(refreshToken: string) {
+async function acquireToken(refreshToken: string): Promise<StepFunAuth> {
+  if (isAnonymousToken(refreshToken)) return acquireAnonymousIdentity();
   let result = accessTokenMap.get(refreshToken);
   if (!result) {
-    logger.info(`[DEBUG] acquireToken: cache miss, fetching fresh token`);
     result = await requestToken(refreshToken);
     accessTokenMap.set(refreshToken, result);
   } else {
-    const remaining = result.refreshTime - util.unixTimestamp();
-    logger.info(`[DEBUG] acquireToken: cache hit, expires in ${remaining}s, token prefix=${result.accessToken.substring(0, 30)}...`);
     if (util.unixTimestamp() > result.refreshTime) {
-      logger.info(`[DEBUG] acquireToken: cache expired, refreshing`);
       result = await requestToken(refreshToken);
       accessTokenMap.set(refreshToken, result);
     }
@@ -202,38 +425,50 @@ async function acquireToken(refreshToken: string) {
  *
  * @param refreshToken 用于刷新access_token的refresh_token
  */
-async function createConversation(refreshToken: string) {
+// Explicación: Agregar registros detallados en la creación de sesiones para rastrear si se congela al comunicarse con la API de StepFun o al activar la página de chat.
+async function createConversationWithAuth(refreshToken: string) {
+  logger.info(`[StepFun会话] 准备为 token="${refreshToken.substring(0, 15)}..." 创建会话。正在等待频率限制限制器(throttleConversationCreate)...`);
   await throttleConversationCreate();
-  const { deviceId, token } = await acquireToken(refreshToken);
-  const cookieStr = generateCookie(deviceId, token);
-  logger.info(`[DEBUG] CreateChatSession request: deviceId=${deviceId}, cookie prefix=${cookieStr.substring(0, 80)}...`);
-  const result = await axios.post(
-    "https://www.stepfun.com/api/agent/capy.agent.v1.AgentService/CreateChatSession",
-    {},
-    {
-      headers: {
-        Cookie: generateCookie(deviceId, token),
-        "Oasis-Webid": deviceId,
-        Referer: "https://www.stepfun.com/chats/new",
-        ...FAKE_HEADERS,
-      },
-      timeout: 15000,
-      validateStatus: () => true,
+  logger.info(`[StepFun会话] 频率限制等待结束，正在获取/刷新身份凭证...`);
+  const auth = await acquireStepFunAuth(refreshToken);
+  logger.info(`[StepFun会话] 凭证获取成功: deviceId=${auth.deviceId.substring(0, 16)}..., anonymous=${!!auth.anonymous}`);
+  
+  const headers = getStepFunHeaders(auth, "https://www.stepfun.com/chats/new", "application/json");
+  logger.info(`[StepFun会话] 正在向 StepFun 发送 CreateChatSession 请求...`);
+  
+  try {
+    const result = await axios.post(
+      "https://www.stepfun.com/api/agent/capy.agent.v1.AgentService/CreateChatSession",
+      {},
+      {
+        headers,
+        timeout: 15000,
+        validateStatus: () => true,
+      }
+    );
+    logger.info(`[StepFun会话] CreateChatSession 请求返回: HTTP 状态码=${result.status}`);
+    const sessionData = checkResult(result, refreshToken);
+    const chatSessionId = sessionData?.chatSession?.chatSessionId;
+    if (!chatSessionId) {
+      logger.error(`[StepFun会话] CreateChatSession 没有返回 chatSessionId, 完整数据=${JSON.stringify(result.data).substring(0, 500)}`);
+      throw new APIException(EX.API_REQUEST_FAILED, `创建会话失败: StepFun 未返回会话ID`);
     }
-  );
-  logger.info(`CreateChatSession response status=${result.status}, data=${JSON.stringify(result.data).substring(0, 500)}`);
-  const sessionData = checkResult(result, refreshToken);
-  const chatSessionId = sessionData?.chatSession?.chatSessionId;
-  if (!chatSessionId) {
-    logger.error(`CreateChatSession returned no chatSessionId, full data=${JSON.stringify(result.data).substring(0, 500)}`);
-    throw new APIException(EX.API_REQUEST_FAILED, `创建会话失败: StepFun 未返回会话ID`);
+    logger.info(`[StepFun会话] 成功获得会话ID: "${chatSessionId}"。正在激活会话页面(activateConversationPage)...`);
+    await activateConversationPage(chatSessionId, auth);
+    logger.success(`[StepFun会话] 会话激活成功, SessionID="${chatSessionId}"`);
+    return { chatSessionId, auth };
+  } catch (error: any) {
+    logger.error(`[StepFun会话] 创建会话抛出异常: ${error.message}`, error);
+    throw error;
   }
-  await activateConversationPage(chatSessionId, deviceId, token);
-  logger.success(`Created new conversation: ${chatSessionId}`);
+}
+
+async function createConversation(refreshToken: string) {
+  const { chatSessionId } = await createConversationWithAuth(refreshToken);
   return chatSessionId;
 }
 
-async function activateConversationPage(chatSessionId: string, deviceId: string, token: string) {
+async function activateConversationPage(chatSessionId: string, auth: StepFunAuth) {
   const nextRouterStateTree = encodeURIComponent(
     JSON.stringify([
       "",
@@ -264,19 +499,18 @@ async function activateConversationPage(chatSessionId: string, deviceId: string,
     {
       headers: {
         Accept: "*/*",
-        Cookie: generateCookie(deviceId, token),
-        "Oasis-Webid": deviceId,
+        Cookie: auth.cookie || generateCookie(auth.deviceId, auth.token),
+        "Oasis-Webid": auth.deviceId,
         "Next-Router-State-Tree": nextRouterStateTree,
         "Next-Url": `/chats/${chatSessionId}`,
         Rsc: "1",
         Referer: `https://www.stepfun.com/chats/${chatSessionId}`,
-        ...FAKE_HEADERS,
+        ...(auth.anonymous ? ANONYMOUS_HEADERS : FAKE_HEADERS),
       },
       timeout: 15000,
       validateStatus: () => true,
     }
   );
-  logger.info(`Activate conversation page response status=${result.status}, sessionId=${chatSessionId}`);
 }
 
 function getBrowserStateKey(refreshToken: string) {
@@ -324,22 +558,53 @@ async function getBrowserState(refreshToken: string) {
   return state;
 }
 
+// Explicación: Agregar registros detallados para la depuración de Playwright, identificando si se bloquea al cargar la página o al inyectar cookies.
 async function getBrowserPage(refreshToken: string) {
   const stateKey = getBrowserStateKey(refreshToken);
+  logger.info(`[浏览器页面] 正在获取浏览器状态 (stateKey="${stateKey}")...`);
   const state = await getBrowserState(refreshToken);
+  
+  logger.info(`[浏览器页面] 正在获取/刷新凭据以注入 Cookie...`);
   const { deviceId, token } = await acquireToken(refreshToken);
+  
+  if (state.deviceId && state.deviceId !== deviceId) {
+    // Explicación: Si el ID del dispositivo cambia (por ejemplo, después de una rotación de identidad anónima), forzamos el cierre de la página web anterior para evitar usar credenciales obsoletas almacenadas en la memoria del navegador y evitar el bloqueo.
+    logger.warn(`[浏览器页面] 账号凭证发生变更 (旧deviceId=${state.deviceId.substring(0, 16)}... -> 新deviceId=${deviceId.substring(0, 16)}...). 强制关闭旧 Page 并重置 Session ID.`);
+    if (state.page && !state.page.isClosed()) {
+      try {
+        await state.page.close();
+      } catch (closeErr: any) {
+        logger.error(`[浏览器页面] 关闭旧页面失败: ${closeErr.message}`);
+      }
+    }
+    state.page = null;
+    state.chatSessionId = null;
+  }
+  state.deviceId = deviceId;
+  
   try {
+    logger.info(`[浏览器页面] 正在向浏览器上下文注入 Cookie: Oasis-Webid="${deviceId.substring(0, 16)}..."`);
     await state.context.addCookies([
       { name: "Oasis-Token", value: token, domain: "www.stepfun.com", path: "/", httpOnly: false, secure: true, sameSite: "Lax" },
       { name: "Oasis-Webid", value: deviceId, domain: "www.stepfun.com", path: "/", httpOnly: false, secure: true, sameSite: "Lax" },
     ]);
-    if (state.page && !state.page.isClosed()) return state.page;
+    
+    if (state.page && !state.page.isClosed()) {
+      logger.info(`[浏览器页面] 复用已有未关闭页面, 当前URL="${state.page.url()}"`);
+      return state.page;
+    }
+    
+    logger.info(`[浏览器页面] 创建新页面或获取默认页面...`);
     state.page = state.context.pages()[0] || await state.context.newPage();
+    
     if (!state.page.url().startsWith("https://www.stepfun.com")) {
+      logger.info(`[浏览器页面] 页面不在 stepfun 域，正在导航到 /chats/new ...`);
       await state.page.goto("https://www.stepfun.com/chats/new", { waitUntil: "domcontentloaded" });
+      logger.info(`[浏览器页面] 导航完成, 当前URL="${state.page.url()}"`);
     }
     return state.page;
-  } catch (err) {
+  } catch (err: any) {
+    logger.error(`[浏览器页面] 获取浏览器页面发生异常: ${err.message}`, err);
     browserStateMap.delete(stateKey);
     logger.warn(`Browser state for account ${stateKey} is unavailable, recreating: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -347,42 +612,58 @@ async function getBrowserPage(refreshToken: string) {
 }
 
 async function createBrowserConversation(refreshToken: string) {
+  logger.info(`[浏览器会话] 准备创建浏览器会话。正在等待频率限制(throttleConversationCreate)...`);
   await throttleConversationCreate();
+  logger.info(`[浏览器会话] 频率限制等待结束，正在获取浏览器 Page 实例...`);
   const page = await getBrowserPage(refreshToken);
-  const sessionData = await page.evaluate(async () => {
-    const resp = await fetch("/api/agent/capy.agent.v1.AgentService/CreateChatSession", {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        accept: "*/*",
-        "content-type": "application/json",
-        "connect-protocol-version": "1",
-        canary: "false",
-        "oasis-appid": "10200",
-        "oasis-language": "zh",
-        "oasis-platform": "web",
-        "x-waf-client-type": "fetch_sdk",
-      },
-      body: "{}",
+  
+  logger.info(`[浏览器会话] 正在浏览器内部执行 CreateChatSession 接口请求...`);
+  try {
+    const sessionData = await page.evaluate(async () => {
+      const resp = await fetch("/api/agent/capy.agent.v1.AgentService/CreateChatSession", {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          accept: "*/*",
+          "content-type": "application/json",
+          "connect-protocol-version": "1",
+          canary: "false",
+          "oasis-appid": "10200",
+          "oasis-language": "zh",
+          "oasis-platform": "web",
+          "x-waf-client-type": "fetch_sdk",
+        },
+        body: "{}",
+      });
+      return {
+        status: resp.status,
+        text: await resp.text(),
+      };
     });
-    return {
-      status: resp.status,
-      text: await resp.text(),
-    };
-  });
-  logger.info(`Browser CreateChatSession response status=${sessionData.status}, data=${sessionData.text.substring(0, 500)}`);
-  const result = JSON.parse(sessionData.text);
-  if (result.code) {
-    throw new APIException(EX.API_REQUEST_FAILED, `[浏览器请求step失败]: ${result.message || result.code}`);
+    
+    logger.info(`[浏览器会话] 浏览器内 CreateChatSession 请求返回: HTTP 状态码=${sessionData.status}`);
+    const result = JSON.parse(sessionData.text);
+    if (result.code) {
+      logger.error(`[浏览器会话] 业务逻辑错误: code=${result.code}, message=${result.message}`);
+      throw new APIException(EX.API_REQUEST_FAILED, `[浏览器请求step失败]: ${result.message || result.code}`);
+    }
+    
+    const chatSessionId = result?.chatSession?.chatSessionId;
+    if (!chatSessionId) {
+      logger.error(`[浏览器会话] StepFun 未返回 chatSessionId, 完整响应=${sessionData.text}`);
+      throw new APIException(EX.API_REQUEST_FAILED, `浏览器创建会话失败: StepFun 未返回会话ID`);
+    }
+    
+    logger.info(`[浏览器会话] 成功创建浏览器会话: "${chatSessionId}"。正在激活浏览器会话页面...`);
+    const state = await getBrowserState(refreshToken);
+    state.chatSessionId = chatSessionId;
+    await activateBrowserConversationPage(refreshToken, chatSessionId);
+    logger.success(`[浏览器会话] 浏览器会话创建并激活完成, SessionID="${chatSessionId}"`);
+    return chatSessionId;
+  } catch (error: any) {
+    logger.error(`[浏览器会话] 创建会话失败: ${error.message}`, error);
+    throw error;
   }
-  const chatSessionId = result?.chatSession?.chatSessionId;
-  if (!chatSessionId) {
-    throw new APIException(EX.API_REQUEST_FAILED, `浏览器创建会话失败: StepFun 未返回会话ID`);
-  }
-  const state = await getBrowserState(refreshToken);
-  state.chatSessionId = chatSessionId;
-  await activateBrowserConversationPage(refreshToken, chatSessionId);
-  return chatSessionId;
 }
 
 function resetBrowserConversation() {
@@ -437,24 +718,36 @@ async function activateBrowserConversationPage(refreshToken: string, chatSession
     await resp.text();
     return resp.status;
   }, { chatSessionId, nextRouterStateTree });
-  logger.info(`Browser activate conversation page response status=${status}, sessionId=${chatSessionId}`);
 }
 
+// Explicación: Agregar registros de depuración para rastrear la transmisión de chat en el navegador. Esto nos ayuda a saber si la transmisión se detiene o falla inesperadamente.
 async function createBrowserChatStream(refreshToken: string, chatSessionId: string, body: Buffer) {
+  logger.info(`[浏览器流] 准备启动浏览器流... sessionId="${chatSessionId}"`);
   const page = await getBrowserPage(refreshToken);
   const stream = new PassThrough();
   const streamId = `step_stream_${++browserStreamId}`;
+  
+  let chunksCount = 0;
+  let bytesCount = 0;
+  
+  logger.info(`[浏览器流] 正在注册流式回调: window["${streamId}"]`);
   await page.exposeFunction(streamId, (chunk: number[] | null, error?: string) => {
     if (error) {
+      logger.error(`[浏览器流] 回调收到浏览器内流异常 (streamId="${streamId}"): ${error}`);
       stream.destroy(new Error(error));
       return;
     }
     if (!chunk) {
+      logger.info(`[浏览器流] 回调收到结束信号 [EOF] (streamId="${streamId}"). 总共接收数据块=${chunksCount}, 字节数=${bytesCount}`);
       stream.end();
       return;
     }
+    chunksCount += 1;
+    bytesCount += chunk.length;
     stream.write(Buffer.from(chunk));
   });
+  
+  logger.info(`[浏览器流] 正在浏览器页面中异步触发 ChatStream 的 fetch 动作...`);
   page.evaluate(async ({ streamId, chatSessionId, body }) => {
     try {
       const resp = await fetch("/api/agent/capy.agent.v1.AgentService/ChatStream", {
@@ -484,7 +777,10 @@ async function createBrowserChatStream(refreshToken: string, chatSessionId: stri
     } catch (err) {
       await (window as any)[streamId](null, err instanceof Error ? err.message : String(err));
     }
-  }, { streamId, chatSessionId, body: Array.from(body) }).catch((err) => stream.destroy(err));
+  }, { streamId, chatSessionId, body: Array.from(body) }).catch((err) => {
+    logger.error(`[浏览器流] page.evaluate 内流执行捕获到异常: ${err.message}`, err);
+    stream.destroy(err);
+  });
   return stream;
 }
 
@@ -501,7 +797,7 @@ function buildChatToolPrompt(tools: any[]): string {
     return `- ${name}: ${desc} (required parameters: ${required})`;
   }).join('\n');
 
-  return `You have access to the following tools. When you need to use a tool, append a DSML tool call block at the end of your response in exactly this format:
+  return `You have access to the following tools. When you need to use a tool, immediately output a DSML tool call block in exactly this format:
 
 <|DSML|tool_calls>
   <|DSML|invoke name="tool_name">
@@ -511,7 +807,8 @@ function buildChatToolPrompt(tools: any[]): string {
 
 You can call multiple tools in parallel by adding multiple <|DSML|invoke> blocks.
 Wrap parameter values in <![CDATA[...]]> to avoid XML escaping issues.
-Output ONLY the DSML block at the end of your text response. Do not wrap it in markdown code fences.
+If a tool is needed, output ONLY the DSML block and do not output any explanation, prefix, suffix, or markdown code fences before the tool call.
+After tool results are provided by the client, continue the final answer based on those results.
 
 Available tools:
 ${summaries}`;
@@ -573,8 +870,6 @@ async function createCompletion(
   retryCount = 0
 ) {
   return (async () => {
-    logger.info(messages);
-
     const hasTools = Array.isArray(tools) && tools.length > 0;
     const toolPrompt = hasTools ? buildChatToolPrompt(tools) : '';
     const toolPromptMsg = toolPrompt ? { role: 'system', content: toolPrompt, __stepFreeToolPrompt: true } : null;
@@ -589,33 +884,31 @@ async function createCompletion(
     const currentInput = await applyCurrentInputFileIfNeeded(enhancedMessages, refs, refreshToken);
 
     if (process.env.STEPFUN_BROWSER_MODE === "1") {
+      const auth = await acquireStepFunAuth(refreshToken);
       const convId = await createBrowserConversation(refreshToken);
-      const result = await createBrowserChatStream(refreshToken, convId, messagesPrepare(convId, currentInput.messages, currentInput.refs));
+      const result = await createBrowserChatStream(refreshToken, convId, messagesPrepare(convId, currentInput.messages, currentInput.refs, resolveStepFunModel(model)));
       const streamStartTime = util.timestamp();
-      logger.info(`Browser ChatStream started, convId=${convId}`);
-      const answer = await receiveStream(model, convId, result);
+      const promptTokens = estimateMessagesTokens(currentInput.messages);
+      const answer = await receiveStream(model, convId, result, promptTokens);
       logger.success(
         `Browser stream has completed transfer ${util.timestamp() - streamStartTime}ms`
       );
+      if (auth.anonymous && isNeedSignInAnswer(answer) && retryCount < 1) {
+        // Explicación: Si se detecta que el usuario anónimo necesita iniciar sesión en el modo de navegador (por haber alcanzado el límite de chat), invalidamos las credenciales actuales y reintentamos de inmediato.
+        logger.warn("StepFun anonymous identity reached chat limit in browser mode, renewing and retrying once");
+        clearAnonymousIdentity(auth);
+        return createCompletion(model, messages, refreshToken, useSearch, tools, toolChoice, retryCount + 1);
+      }
+      reserveAnonymousTurn(auth);
       return hasTools ? parseToolCallsFromAnswer(answer, tools) : answer;
     }
 
-    const convId = await createConversation(refreshToken);
-    const { deviceId, token } = await acquireToken(refreshToken);
-    const chatCookie = generateCookie(deviceId, token);
-    logger.info(`[DEBUG] ChatStream request: deviceId=${deviceId}, convId=${convId}, cookie prefix=${chatCookie.substring(0, 80)}...`);
+    const { chatSessionId: convId, auth } = await createConversationWithAuth(refreshToken);
     const result = await axios.post(
       "https://www.stepfun.com/api/agent/capy.agent.v1.AgentService/ChatStream",
-      messagesPrepare(convId, currentInput.messages, currentInput.refs),
+      messagesPrepare(convId, currentInput.messages, currentInput.refs, resolveStepFunModel(model)),
       {
-        headers: {
-          "Content-Type": "application/connect+json",
-          Cookie: chatCookie,
-          "Oasis-Webid": deviceId,
-          "Canary": false,
-          Referer: `https://www.stepfun.com/chats/${convId}`,
-          ...FAKE_HEADERS,
-        },
+        headers: getStepFunHeaders(auth, `https://www.stepfun.com/chats/${convId}`, "application/connect+json"),
         // 120秒超时
         timeout: 120000,
         validateStatus: () => true,
@@ -624,12 +917,18 @@ async function createCompletion(
     );
 
     const streamStartTime = util.timestamp();
-    logger.info(`ChatStream response status=${result.status}, convId=${convId}`);
     // 接收流为输出文本
-    const answer = await receiveStream(model, convId, result.data);
+    const promptTokens = estimateMessagesTokens(currentInput.messages);
+    const answer = await receiveStream(model, convId, result.data, promptTokens);
     logger.success(
       `Stream has completed transfer ${util.timestamp() - streamStartTime}ms`
     );
+    if (auth.anonymous && isNeedSignInAnswer(answer) && retryCount < 1) {
+      logger.warn("StepFun anonymous identity reached chat limit, renewing and retrying once");
+      clearAnonymousIdentity(auth);
+      return createCompletion(model, messages, refreshToken, useSearch, tools, toolChoice, retryCount + 1);
+    }
+    reserveAnonymousTurn(auth);
     return hasTools ? parseToolCallsFromAnswer(answer, tools) : answer;
   })().catch((err) => {
     if (retryCount < MAX_RETRY_COUNT) {
@@ -671,8 +970,6 @@ async function createCompletionStream(
   retryCount = 0
 ) {
   return (async () => {
-    logger.info(messages);
-
     const hasTools = Array.isArray(tools) && tools.length > 0;
     const toolPrompt = hasTools ? buildChatToolPrompt(tools) : '';
     const toolPromptMsg = toolPrompt ? { role: 'system', content: toolPrompt, __stepFreeToolPrompt: true } : null;
@@ -688,17 +985,43 @@ async function createCompletionStream(
     const currentInput = await applyCurrentInputFileIfNeeded(enhancedMessages, refs, refreshToken);
 
     if (process.env.STEPFUN_BROWSER_MODE === "1") {
+      const auth = await acquireStepFunAuth(refreshToken);
       const convId = await createBrowserConversation(refreshToken);
-      const result = await createBrowserChatStream(refreshToken, convId, messagesPrepare(convId, currentInput.messages, currentInput.refs));
+      const result = await createBrowserChatStream(refreshToken, convId, messagesPrepare(convId, currentInput.messages, currentInput.refs, resolveStepFunModel(model)));
       const streamStartTime = util.timestamp();
-      logger.info(`Browser ChatStream started, convId=${convId}`);
+      const promptTokens = estimateMessagesTokens(currentInput.messages);
       const transStream = createTransStream(model, convId, result, () => {
         logger.success(
           `Browser stream has completed transfer ${util.timestamp() - streamStartTime}ms`
         );
-      }, tools, { endOnSourceClose: false });
+        reserveAnonymousTurn(auth);
+      }, tools, {
+        endOnSourceClose: false,
+        onNeedSignIn: auth.anonymous && retryCount < 1 ? () => {
+          // Explicación: Limpiamos la identidad anónima y reintentamos la transmisión cuando el navegador recibe un error que indica que se requiere iniciar sesión (debido a la expiración de la sesión o al límite alcanzado).
+          logger.warn("StepFun anonymous identity reached stream limit in browser mode, renewing and retrying once");
+          clearAnonymousIdentity(auth);
+          return createCompletionStream(
+            model,
+            messages,
+            refreshToken,
+            useSearch,
+            tools,
+            toolChoice,
+            retryCount + 1
+          );
+        } : undefined,
+        onEmptyResponse: retryCount < 1 ? () => createCompletionStream(
+          model,
+          [...messages, { role: "user", content: "上一轮没有产生用户可见回答。请直接继续并给出可见答案，不要重复工具调用。" }],
+          refreshToken,
+          useSearch,
+          tools,
+          toolChoice,
+          retryCount + 1
+        ) : undefined,
+      }, promptTokens);
       if (STREAM_TIMEOUT_MS > 0 && retryCount < STREAM_TIMEOUT_RETRY_COUNT) {
-        logger.info(`Browser stream timeout guard enabled: ${STREAM_TIMEOUT_MS}ms`);
         const timeout = setTimeout(async () => {
           if (transStream.destroyed || transStream.writableEnded) return;
           logger.warn(`Browser stream timed out after ${STREAM_TIMEOUT_MS}ms, summarizing context before retry`);
@@ -720,24 +1043,14 @@ async function createCompletionStream(
       return transStream;
     }
     // 创建会话
-    const convId = await createConversation(refreshToken);
+    const { chatSessionId: convId, auth } = await createConversationWithAuth(refreshToken);
 
     // 请求流
-    const { deviceId, token } = await acquireToken(refreshToken);
-    const chatCookie = generateCookie(deviceId, token);
-    logger.info(`[DEBUG] ChatStream request: deviceId=${deviceId}, convId=${convId}, cookie prefix=${chatCookie.substring(0, 80)}...`);
     const result = await axios.post(
       "https://www.stepfun.com/api/agent/capy.agent.v1.AgentService/ChatStream",
-      messagesPrepare(convId, currentInput.messages, currentInput.refs),
+      messagesPrepare(convId, currentInput.messages, currentInput.refs, resolveStepFunModel(model)),
       {
-        headers: {
-          "Content-Type": "application/connect+json",
-          Cookie: chatCookie,
-          "Oasis-Webid": deviceId,
-          "Canary": false,
-          Referer: `https://www.stepfun.com/chats/${convId}`,
-          ...FAKE_HEADERS,
-        },
+        headers: getStepFunHeaders(auth, `https://www.stepfun.com/chats/${convId}`, "application/connect+json"),
         timeout: STREAM_TIMEOUT_MS > 0 ? STREAM_TIMEOUT_MS : 120000,
         validateStatus: () => true,
         responseType: "stream",
@@ -745,15 +1058,38 @@ async function createCompletionStream(
     );
 
     const streamStartTime = util.timestamp();
-    logger.info(`ChatStream response status=${result.status}, convId=${convId} (streaming)`);
     // 创建转换流将消息格式转换为gpt兼容格式
+    const promptTokens = estimateMessagesTokens(currentInput.messages);
     const transStream = createTransStream(model, convId, result.data, () => {
       logger.success(
         `Stream has completed transfer ${util.timestamp() - streamStartTime}ms`
       );
-    }, tools);
+      reserveAnonymousTurn(auth);
+    }, tools, {
+      onNeedSignIn: auth.anonymous && retryCount < 1 ? () => {
+        logger.warn("StepFun anonymous identity reached stream limit, renewing and retrying once");
+        clearAnonymousIdentity(auth);
+        return createCompletionStream(
+          model,
+          messages,
+          refreshToken,
+          useSearch,
+          tools,
+          toolChoice,
+          retryCount + 1
+        );
+      } : undefined,
+      onEmptyResponse: retryCount < 1 ? () => createCompletionStream(
+        model,
+        [...messages, { role: "user", content: "上一轮没有产生用户可见回答。请直接继续并给出可见答案，不要重复工具调用。" }],
+        refreshToken,
+        useSearch,
+        tools,
+        toolChoice,
+        retryCount + 1
+      ) : undefined,
+    }, promptTokens);
     if (STREAM_TIMEOUT_MS > 0 && retryCount < STREAM_TIMEOUT_RETRY_COUNT) {
-      logger.info(`Stream timeout guard enabled: ${STREAM_TIMEOUT_MS}ms`);
       const timeout = setTimeout(async () => {
         if (transStream.destroyed || transStream.writableEnded) return;
         logger.warn(`Stream timed out after ${STREAM_TIMEOUT_MS}ms, summarizing context before retry`);
@@ -809,7 +1145,6 @@ function extractRefFileUrls(messages: any[]) {
       if (url && !urls.includes(url)) urls.push(url);
     });
   });
-  logger.info("本次请求上传：" + urls.length + "个文件");
   return urls;
 }
 
@@ -873,24 +1208,50 @@ async function withSummarizedRetryContext(messages: any[], refreshToken: string)
  *
  * @param messages 参考gpt系列消息格式，多轮对话请完整提供上下文
  */
-function messagesPrepare(chatSessionId: string, messages: any[], refs: any[]) {
+const EXTERNAL_CONTENT_RE = /<<<EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>[\s\S]*?<<<END_EXTERNAL_UNTRUSTED_CONTENT[^>]*>>>/gi;
+function scrubExternalContent(text: string) {
+  return text.replace(EXTERNAL_CONTENT_RE, "[external content omitted]");
+}
+
+function resolveStepFunModel(model: string): string {
+  if (/deepseek/i.test(model)) return 'deepseek-r1';
+  return 'step-auto';
+}
+
+function cleanMessageContentForPrepare(content: any): string {
+  if (!content) return "";
+  let text = _.isString(content) ? content : normalizeMessageContentForTranscript(content);
+  
+  // Explicación: Limpiamos y restauramos los mensajes del historial que contienen resúmenes largos o instrucciones de continuación interna, extrayendo únicamente la pregunta real del usuario para evitar el crecimiento exponencial del contexto y bloqueos en Playwright.
+  if (/Use the provided prior context internally/i.test(text)) {
+    const match = text.match(/(?:Latest user request|latest user request):\s*([\s\S]+)$/i);
+    if (match && match[1]) {
+      return match[1].trim();
+    }
+  }
+  return text;
+}
+
+function messagesPrepare(chatSessionId: string, messages: any[], refs: any[], stepModel = 'step-auto') {
   const attachments = refs.map(formatStepFunAttachment).filter(Boolean);
   const content =
     messages.reduce((content, message) => {
       if (_.isArray(message.content)) {
         return message.content.reduce((_content, v) => {
           if (!_.isObject(v) || v["type"] != "text") return _content;
-          const text = _.isString(v["text"]) ? v["text"] : JSON.stringify(v["text"]);
+          const cleanedText = cleanMessageContentForPrepare(v["text"]);
+          const text = scrubExternalContent(cleanedText);
           if (!text) return _content;
           return _content + `${message.role || "user"}:${text || ""}\n`;
         }, content);
       }
-      const msgContent = _.isString(message.content) ? message.content : JSON.stringify(message.content);
+      const cleanedContent = cleanMessageContentForPrepare(message.content);
+      const msgContent = scrubExternalContent(cleanedContent);
       if (!msgContent) return content;
       return (content += `${message.role || "user"}:${msgContent}\n`);
     }, `system:${CHINESE_REPLY_PROMPT}\n`) + "assistant:";
 
-  logger.info("\n对话合并：\n" + content);
+  logPrompt(content);
 
   const body = {
     message: {
@@ -905,14 +1266,12 @@ function messagesPrepare(chatSessionId: string, messages: any[], refs: any[]) {
       },
     },
     config: {
-      model: "step-auto",
-      enableReasoning: false,
+      model: stepModel,
+      enableReasoning: stepModel === 'deepseek-r1',
     },
   };
 
-  const bodyJson = JSON.stringify(body);
-  logger.info(`ChatStream body (first 500): ${bodyJson.substring(0, 500)}`);
-  return encodeConnectJsonEnvelope(bodyJson);
+  return encodeConnectJsonEnvelope(JSON.stringify(body));
 }
 
 function encodeConnectJsonEnvelope(bodyJson: string) {
@@ -997,7 +1356,7 @@ function normalizeMessageContentForTranscript(content: any): string {
 }
 
 function sanitizePromptHistoryText(text: string) {
-  return String(text || "")
+  return scrubExternalContent(String(text || ""))
     .replace(/You are a personal assistant running inside OpenClaw\.[\s\S]*?(?=\n(?:user|assistant|system):|$)/gi, "[system tool instructions omitted]")
     .replace(/## Tooling[\s\S]*?(?=\n## |\n(?:user|assistant|system):|$)/gi, "[tooling instructions omitted]")
     .replace(/<available_skills>[\s\S]*?<\/available_skills>/gi, "[available skills omitted]")
@@ -1042,48 +1401,9 @@ function clampPromptText(text: string, maxChars: number) {
 }
 
 async function summarizeLongContext(text: string, refreshToken: string, force = false) {
-  if (!force && (CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS <= 0 || text.length < CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS)) return text;
-  logger.info(`Current input context exceeds summarize threshold: ${text.length}/${CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS}`);
-  const summaryPrompt = [
-    "请将下面的历史对话记录压缩总结为后续对话可继续使用的新上下文。",
-    `要求：只总结真实用户/助手对话内容；保留用户目标、已完成操作、关键文件/代码改动、错误与解决方案、待办事项、重要约束；忽略 system/developer 指令、工具协议、工具清单、Project Context、OpenClaw 运行说明、重复日志；使用简体中文；长度尽量控制在 ${CURRENT_INPUT_SUMMARY_MAX_CHARS} 字以内。`,
-    "",
-    "历史上下文：",
-    text,
-  ].join("\n");
-  try {
-    const convId = process.env.STEPFUN_BROWSER_MODE === "1"
-      ? await createBrowserConversation(refreshToken)
-      : await createConversation(refreshToken);
-    const body = messagesPrepare(convId, [{ role: "user", content: summaryPrompt }], []);
-    const tokenInfo = process.env.STEPFUN_BROWSER_MODE === "1" ? null : await acquireToken(refreshToken);
-    const stream = process.env.STEPFUN_BROWSER_MODE === "1"
-      ? await createBrowserChatStream(refreshToken, convId, body)
-      : (await axios.post(
-          "https://www.stepfun.com/api/agent/capy.agent.v1.AgentService/ChatStream",
-          body,
-          {
-            headers: {
-              "Content-Type": "application/connect+json",
-              Cookie: generateCookie(tokenInfo!.deviceId, tokenInfo!.token),
-              "Oasis-Webid": tokenInfo!.deviceId,
-              "Canary": false,
-              Referer: `https://www.stepfun.com/chats/${convId}`,
-              ...FAKE_HEADERS,
-            },
-            timeout: 120000,
-            validateStatus: () => true,
-            responseType: "stream",
-          }
-        )).data;
-    const answer: any = await receiveStream(MODEL_NAME, convId, stream);
-    const summary = String(answer?.choices?.[0]?.message?.content || "").trim();
-    if (!summary) throw new Error("empty summary");
-    return `# ${CURRENT_INPUT_FILENAME} 压缩总结\n\n${clampPromptText(summary, CURRENT_INPUT_SUMMARY_MAX_CHARS)}\n`;
-  } catch (err) {
-    logger.warn(`Current input context summarize failed, falling back to clipped context: ${err instanceof Error ? err.message : String(err)}`);
-    return clampPromptText(text, CURRENT_INPUT_SUMMARY_MAX_CHARS);
-  }
+  // Explicación: Para evitar retrasos de red, límites de frecuencia y bloqueos indefinidos por tiempo de espera en la API externa al procesar historiales muy largos, realizamos el recorte directamente en la memoria. Esto garantiza un rendimiento de 0 ms y evita cuellos de botella o interrupciones indefinidas en la ejecución del hilo principal.
+  logger.info(`[上下文压缩] 跳过外部 API 压缩总结，直接进行本地内存截断以保证零阻塞高可用`);
+  return clampPromptText(text, CURRENT_INPUT_SUMMARY_MAX_CHARS);
 }
 
 function hasPromptOverflowArtifacts(messages: any[]) {
@@ -1152,18 +1472,25 @@ async function applyCurrentInputFileIfNeeded(messages: any[], refs: any[], refre
   const continuationPrefix = hasTrailingToolResult(messages)
     ? "The latest entries in the context are completed tool results. Use them to continue the original user task. Do not repeat historical tool calls. If more actions are needed, call only the next necessary tool; otherwise answer normally.\n\n"
     : "";
+
+  // Explicación: Para evitar que el modelo entre en un bucle infinito llamando repetidamente a la misma herramienta en OpenClaw, debemos conservar todos los mensajes de llamadas y resultados de herramientas posteriores a la última pregunta del usuario en la lista de mensajes principal en lugar de purgarlos.
+  const trailingMessages = messages.slice(latestUser.index + 1).filter((message) => !message?.__stepFreeToolPrompt);
+
   try {
     const ref = await uploadCurrentInputFile(transcript, refreshToken);
-    logger.info(`Current input context (${transcript.length} chars) moved to attached ${CURRENT_INPUT_FILENAME}`);
     const inlineTranscript = clampPromptText(transcript, CURRENT_INPUT_LIVE_MAX_CHARS);
     const latestUserPrompt = latestUserContent
       ? `${continuationPrefix}Use the provided prior context internally. The same context is attached as ${CURRENT_INPUT_FILENAME} and also included below for reliability. Treat historical tool calls/results as already completed and do not repeat them. Continue the task from that context. If the attachment cannot be read, use the inline context below and do not claim the file is empty.\n\nContext:\n${inlineTranscript}\n\nLatest user request:\n${latestUserContent}`
       : `${continuationPrefix}Use the provided prior context internally. The same context is attached as ${CURRENT_INPUT_FILENAME} and also included below for reliability. Treat historical tool calls/results as already completed and do not repeat them. Continue the task from that context and answer the latest user request directly. If the attachment cannot be read, use the inline context below and do not claim the file is empty.\n\nContext:\n${inlineTranscript}`;
     return {
-      messages: [...toolPromptMessages, {
-        role: "user",
-        content: latestUserPrompt,
-      }],
+      messages: [
+        ...toolPromptMessages,
+        {
+          role: "user",
+          content: latestUserPrompt,
+        },
+        ...trailingMessages,
+      ],
       refs: [ref, ...refs],
     };
   } catch (err) {
@@ -1173,10 +1500,14 @@ async function applyCurrentInputFileIfNeeded(messages: any[], refs: any[], refre
       ? `${continuationPrefix}Use the provided prior context internally. Do not call tools to read context files. Treat historical tool calls/results as already completed and do not repeat them. Continue the task from that context.\n\nContext:\n${inlineTranscript}\n\nLatest user request:\n${latestUserContent}`
       : `${continuationPrefix}Use the provided prior context internally. Do not call tools to read context files. Treat historical tool calls/results as already completed and do not repeat them. Continue the task from that context and answer the latest user request directly.\n\nContext:\n${inlineTranscript}`;
     return {
-      messages: [...toolPromptMessages, {
-        role: "user",
-        content: latestUserPrompt,
-      }],
+      messages: [
+        ...toolPromptMessages,
+        {
+          role: "user",
+          content: latestUserPrompt,
+        },
+        ...trailingMessages,
+      ],
       refs,
     };
   }
@@ -1226,7 +1557,7 @@ function extractStepFunEventText(event: any) {
  * @param convId 会话ID
  * @param stream 消息流
  */
-async function receiveStream(model: string, convId: string, stream: any) {
+async function receiveStream(model: string, convId: string, stream: any, promptTokens = 1) {
   return new Promise((resolve, reject) => {
     // 消息初始化
     const data = {
@@ -1240,7 +1571,7 @@ async function receiveStream(model: string, convId: string, stream: any) {
           finish_reason: "stop",
         },
       ],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      usage: { prompt_tokens: promptTokens, completion_tokens: 1, total_tokens: promptTokens + 1 },
       created: util.unixTimestamp(),
     };
     let refContent = "";
@@ -1253,6 +1584,7 @@ async function receiveStream(model: string, convId: string, stream: any) {
       // 新版API事件包装在 data.event 中
       const event = result.data?.event || result;
       if (event.error && event.error.code) {
+        attachStepFunError(data, event.error);
         logger.error(`StepFun stream error: code=${event.error.code}, message=${event.error.message}, fullEvent=${JSON.stringify(event.error)}`);
         data.choices[0].message.content += `服务暂时不可用，第三方响应错误：[${event.error.code}] ${event.error.message}`;
       }
@@ -1305,7 +1637,16 @@ async function receiveStream(model: string, convId: string, stream: any) {
       chunk = Buffer.from([]);
     });
     stream.once("error", (err) => reject(err));
-    stream.once("close", () => resolve(data));
+    stream.once("close", () => {
+      // Explicación: Calculamos de forma dinámica el número exacto de tokens consumidos por la respuesta final y el prompt para mostrar estadísticas de uso correctas en el cliente.
+      const completionTokens = estimateTextTokens(data.choices[0].message.content);
+      data.usage = {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens
+      };
+      resolve(data);
+    });
   });
 }
 
@@ -1338,13 +1679,17 @@ function createTransStream(
   stream: any,
   endCallback?: Function,
   tools?: any[],
-  options: { endOnSourceClose?: boolean } = {}
+  options: { endOnSourceClose?: boolean; onEmptyResponse?: () => Promise<any>; onNeedSignIn?: () => Promise<any> } = {},
+  promptTokens = 1
 ) {
+  let completionText = "";
   // 消息创建时间
   const created = util.unixTimestamp();
+  const streamStartAt = util.timestamp();
   const hasTools = Array.isArray(tools) && tools.length > 0;
   // 创建转换流
   const transStream = new PassThrough();
+  !transStream.closed && transStream.write(`: ${' '.repeat(2048)}\n\n`);
   !transStream.closed &&
     transStream.write(
       `data: ${JSON.stringify({
@@ -1362,7 +1707,21 @@ function createTransStream(
       })}\n\n`
     );
   let ended = false;
+  let upstreamPaused = false;
+  let sourceReplaced = false;
   const canWrite = () => !ended && !transStream.closed && !transStream.writableEnded && !transStream.destroyed;
+  const writeSSE = (payload: any) => {
+    if (!canWrite()) return;
+    const flushed = transStream.write(`data: ${JSON.stringify(payload)}\n\n: ping\n\n`);
+    if (!flushed && !upstreamPaused && typeof stream.pause === 'function' && typeof stream.resume === 'function') {
+      upstreamPaused = true;
+      stream.pause();
+      transStream.once('drain', () => {
+        upstreamPaused = false;
+        if (canWrite()) stream.resume();
+      });
+    }
+  };
   const finishStream = () => {
     if (!canWrite()) return;
     ended = true;
@@ -1371,25 +1730,44 @@ function createTransStream(
 
   let bufferedRefContent = '';
   let processed = false;
+  let hasVisibleOutput = false;
+  let emptyContinuationStarted = false;
+  let riskBlocked = false;
   const toolSieve = createToolSieveState();
 
   function emitTextDelta(text: string) {
     if (!canWrite()) return;
-    transStream.write(`data: ${JSON.stringify({
+    if (text) {
+      hasVisibleOutput = true;
+      completionText += text;
+    }
+    writeSSE({
       id: convId,
       model,
       object: "chat.completion.chunk",
       choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
       created,
-    })}\n\n`);
+    });
+  }
+
+  function emitHeartbeatDelta() {
+    if (!canWrite()) return;
+    writeSSE({
+      id: convId,
+      model,
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: {}, finish_reason: null }],
+      created,
+    });
   }
 
   function emitToolCalls(toolCalls: any[]) {
     if (!canWrite()) return;
+    hasVisibleOutput = true;
     // 发送 text before tool calls (传之前已经 flush 过了，这边只发 tool calls)
     for (const tc of toolCalls) {
       // 1. tool call header (id, type, function.name)
-      transStream.write(`data: ${JSON.stringify({
+      writeSSE({
         id: convId,
         model,
         object: "chat.completion.chunk",
@@ -1406,9 +1784,9 @@ function createTransStream(
           finish_reason: null,
         }],
         created,
-      })}\n\n`);
+      });
       // 2. tool call arguments
-      transStream.write(`data: ${JSON.stringify({
+      writeSSE({
         id: convId,
         model,
         object: "chat.completion.chunk",
@@ -1423,18 +1801,26 @@ function createTransStream(
           finish_reason: null,
         }],
         created,
-      })}\n\n`);
+      });
     }
     // 3. done chunk
+    let totalToolTokens = 0;
+    for (const tc of toolCalls) {
+      totalToolTokens += estimateTextTokens(tc.function.name + tc.function.arguments);
+    }
     const finalData: any = {
       id: convId,
       model,
       object: "chat.completion.chunk",
       choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: totalToolTokens || 1,
+        total_tokens: promptTokens + (totalToolTokens || 1)
+      },
       created,
     };
-    transStream.write(`data: ${JSON.stringify(finalData)}\n\n`);
+    writeSSE(finalData);
     finishStream();
     endCallback && endCallback();
   }
@@ -1449,7 +1835,6 @@ function createTransStream(
       if (processed || !canWrite()) return;
       if (event.toolCalls && event.toolCalls.length > 0) {
         processed = true;
-        logger.info(`Stream tool calls detected: ${event.toolCalls.map(c => c.name).join(', ')}`);
         emitToolCalls(toOpenAIToolCalls(event.toolCalls));
       } else if (event.content) {
         emitTextDelta(event.content);
@@ -1471,14 +1856,52 @@ function createTransStream(
 
   function emitFinishChunk(finishReason: string) {
     if (!canWrite()) return;
-    transStream.write(`data: ${JSON.stringify({
+    // Explicación: Calculamos dinámicamente los tokens generados acumulados en el flujo de texto para emitir el uso exacto.
+    const completionTokens = estimateTextTokens(completionText);
+    writeSSE({
       id: convId,
       model,
       object: "chat.completion.chunk",
       choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      usage: {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+      },
       created,
-    })}\n\n`);
+    });
+  }
+
+  function getStepFunEventType(event: any) {
+    if (event?.error) return 'error';
+    if (event?.pipelineEvent) return 'pipelineEvent';
+    if (event?.textEvent) return 'textEvent';
+    if (event?.messageEvent) return 'messageEvent';
+    if (event?.reasoningEvent) return 'reasoningEvent';
+    if (event?.doneEvent) return 'doneEvent';
+    if (event?.messageDoneEvent) return 'messageDoneEvent';
+    if (event?.startEvent) return 'startEvent';
+    if (event?.sourcingEvent) return 'sourcingEvent';
+    if (event?.heartBeatEvent) return 'heartBeatEvent';
+    if (event?.riskEvent) return 'riskEvent';
+    if (Object.keys(event || {}).length === 0) return 'empty';
+    return 'unknown';
+  }
+
+  function logStepFunEventTiming(event: any, text: string) {
+    const type = getStepFunEventType(event);
+    const keys = type === 'unknown' ? ` keys=${Object.keys(event || {}).join(',')}` : '';
+    logger.info(`[${new Date().toISOString()}] StepFun事件 type=${type} +${util.timestamp() - streamStartAt}ms textLen=${text.length}${keys}`);
+  }
+
+  async function continueEmptyResponse() {
+    if (emptyContinuationStarted || hasVisibleOutput || !options.onEmptyResponse || !canWrite()) return false;
+    emptyContinuationStarted = true;
+    sourceReplaced = true;
+    logger.warn(`StepFun stream ended without visible output, continuing once`);
+    const nextStream = await options.onEmptyResponse();
+    nextStream.pipe(transStream, { end: true });
+    return true;
   }
 
   const parser = (buffer: Buffer) => {
@@ -1488,8 +1911,21 @@ function createTransStream(
       throw new Error(`Stream response invalid: ${result}`);
     // 新版API事件包装在 data.event 中
     const event = result.data?.event || result;
+    const text = extractStepFunEventText(event);
+    logStepFunEventTiming(event, text);
     if (event.error && event.error.code) {
       logger.error(`StepFun stream error (streaming): code=${event.error.code}, message=${event.error.message}, fullEvent=${JSON.stringify(event.error)}`);
+      if (isNeedSignInError(event.error) && options.onNeedSignIn) {
+        processed = true;
+        sourceReplaced = true;
+        options.onNeedSignIn().then((nextStream) => {
+          nextStream.pipe(transStream, { end: true });
+        }).catch((err) => {
+          logger.error(`Anonymous stream retry failed: ${err instanceof Error ? err.message : String(err)}`);
+          finishStream();
+        });
+        return;
+      }
       const data = `data: ${JSON.stringify({
         id: convId,
         model,
@@ -1503,7 +1939,7 @@ function createTransStream(
             finish_reason: "stop",
           },
         ],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        usage: { prompt_tokens: promptTokens, completion_tokens: 1, total_tokens: promptTokens + 1 },
         created,
       })}\n\n`;
       canWrite() && transStream.write(data);
@@ -1523,72 +1959,42 @@ function createTransStream(
         if (hasTools) {
           bufferedRefContent = refContent;
         } else {
-          const data = `data: ${JSON.stringify({
-            id: convId,
-            model,
-            object: "chat.completion.chunk",
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  content: `检索 ${refContent}\n`,
-                },
-                finish_reason: null,
-              },
-            ],
-            created,
-          })}\n\n`;
-          canWrite() && transStream.write(data);
+          emitTextDelta(`检索 ${refContent}\n`);
         }
       }
     } else {
-      const text = extractStepFunEventText(event);
       if (text) {
         if (hasTools) {
           handleToolSieveEvents(processToolStreamChunk(toolSieve, text));
         } else {
-          const data = `data: ${JSON.stringify({
-            id: convId,
-            model,
-            object: "chat.completion.chunk",
-            choices: [
-              {
-                index: 0,
-                delta: { content: text },
-                finish_reason: null,
-              },
-            ],
-            created,
-          })}\n\n`;
-          canWrite() && transStream.write(data);
+          emitTextDelta(text);
         }
       } else if (event.messageEvent) {
       } else if (event.startEvent || event.sourcingEvent) {
+      } else if (event.reasoningEvent) {
+        emitHeartbeatDelta();
       } else if (event.doneEvent || event.messageDoneEvent) {
+        if (!hasVisibleOutput && !riskBlocked && options.onEmptyResponse) {
+          continueEmptyResponse().catch((err) => {
+            logger.error(`Empty stream continuation failed: ${err instanceof Error ? err.message : String(err)}`);
+            if (hasTools) finalizeToolStream();
+            else {
+              emitFinishChunk("stop");
+              finishStream();
+              endCallback && endCallback();
+            }
+          });
+          return;
+        }
         if (hasTools) {
           finalizeToolStream();
         } else {
-          const data = `data: ${JSON.stringify({
-            id: convId,
-            model,
-            object: "chat.completion.chunk",
-            choices: [
-              {
-                index: 0,
-                delta: {},
-                finish_reason: "stop",
-              },
-            ],
-            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-            created,
-          })}\n\n`;
-          canWrite() && transStream.write(data);
+          emitFinishChunk("stop");
           finishStream();
           endCallback && endCallback();
         }
       } else if (event.heartBeatEvent || Object.keys(event).length === 0) {
       } else {
-        logger.info(`Unhandled StepFun stream event: ${JSON.stringify(event).substring(0, 500)}`);
       }
     }
   };
@@ -1600,20 +2006,23 @@ function createTransStream(
     // 接收数据头
     chunk = Buffer.concat([temp, chunk, buffer]);
     // 循环处理chunk中所有完整消息，避免同一条数据内多条消息丢失
-    while (chunk.length >= 5) {
+    while (!upstreamPaused && chunk.length >= 5) {
       const chunkSize = chunk.readUint32BE(1);
       const totalLen = chunkSize + 5;
       if (chunk.length < totalLen) break;
-      if (!canWrite()) break;
+      if (!canWrite() || upstreamPaused) break;
       parser(chunk.subarray(5, totalLen));
       chunk = chunk.subarray(totalLen);
     }
     temp = chunk;
     chunk = Buffer.from([]);
   });
+// Explicación: Agregar registros de depuración en los eventos de finalización y error de la transmisión para diagnosticar por qué se cuelga la respuesta de la API.
   stream.once(
     "error",
-    () => {
+    (err: any) => {
+      logger.error(`[数据传输流] 上游流发生错误: ${err?.message || err}`);
+      if (sourceReplaced && !ended) return;
       if (options.endOnSourceClose === false && !ended) return;
       if (hasTools && !processed) finalizeToolStream();
       else finishStream();
@@ -1622,6 +2031,8 @@ function createTransStream(
   stream.once(
     "close",
     () => {
+      logger.info(`[数据传输流] 上游流已关闭 (close)`);
+      if (sourceReplaced && !ended) return;
       if (options.endOnSourceClose === false && !ended) return;
       if (hasTools && !processed) finalizeToolStream();
       else finishStream();
@@ -1759,7 +2170,7 @@ async function uploadDocumentBuffer(filename: string, fileData: Buffer, mimeType
   const uploadUrl = isImage
     ? "https://www.stepfun.com/api/resource/image"
     : "https://www.stepfun.com/api/resource/document";
-  const { deviceId, token } = await acquireToken(refreshToken);
+  const auth = await acquireStepFunAuth(refreshToken);
   const form = new FormData();
   form.append("file", fileData, { filename, contentType: mimeType });
   form.append("scene_id", isImage ? "image" : "file");
@@ -1768,16 +2179,15 @@ async function uploadDocumentBuffer(filename: string, fileData: Buffer, mimeType
     maxBodyLength: FILE_MAX_SIZE,
     timeout: 60000,
     headers: {
-      Cookie: generateCookie(deviceId, token),
-      "Oasis-Webid": deviceId,
+      Cookie: auth.cookie || generateCookie(auth.deviceId, auth.token),
+      "Oasis-Webid": auth.deviceId,
       Referer: "https://www.stepfun.com/chats/new",
-      ...FAKE_HEADERS,
+      ...(auth.anonymous ? ANONYMOUS_HEADERS : FAKE_HEADERS),
       ...form.getHeaders(),
     },
     validateStatus: () => true,
   });
   const payload = checkResult(result, refreshToken);
-  logger.info(`Upload document response: ${JSON.stringify(payload).substring(0, 500)}`);
   const fileId = extractUploadedFileId(payload);
   if (!fileId) {
     throw new APIException(
@@ -1823,8 +2233,40 @@ function extractUploadedFileId(payload: any): string {
 
 async function uploadCurrentInputFile(text: string, refreshToken: string) {
   const data = Buffer.from(text, "utf8");
-  logger.info(`Uploading current input context file: ${CURRENT_INPUT_FILENAME}, chars=${text.length}, bytes=${data.byteLength}`);
   return uploadDocumentBuffer(CURRENT_INPUT_FILENAME, data, CURRENT_INPUT_CONTENT_TYPE, refreshToken);
+}
+
+/**
+ * Explicación: Estimamos los tokens con un algoritmo heurístico preciso para español/inglés/chino.
+ * Un carácter chino equivale a 1.3 tokens aproximadamente, y los caracteres occidentales/otros equivalen a 0.35 tokens.
+ * Esto proporciona al cliente OpenClaw una visualización exacta del consumo de tokens y el uso del contexto.
+ */
+export function estimateTextTokens(text: string): number {
+  if (!text) return 0;
+  const chMatches = text.match(/[\u4e00-\u9fa5]|[\u3000-\u303f]|[\uff00-\uffef]/g);
+  const chineseLen = chMatches ? chMatches.length : 0;
+  const otherLen = text.length - chineseLen;
+  return Math.max(1, Math.ceil(chineseLen * 1.3 + otherLen * 0.35));
+}
+
+/**
+ * Explicación: Estimamos los tokens acumulados a partir de los mensajes para representar con precisión el prompt de entrada.
+ */
+export function estimateMessagesTokens(messages: any[]): number {
+  let totalLength = 0;
+  for (const msg of messages) {
+    if (!msg) continue;
+    if (typeof msg.content === 'string') {
+      totalLength += msg.content.length;
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part && typeof part === 'object' && part.type === 'text') {
+          totalLength += String(part.text || "").length;
+        }
+      }
+    }
+  }
+  return totalLength > 0 ? estimateTextTokens(totalLength > 0 ? " " : "") || Math.max(1, Math.ceil(totalLength / 1.5)) : 1;
 }
 
 /**
@@ -1866,6 +2308,11 @@ async function getTokenLiveStatus(refreshToken: string) {
   }
 }
 
+// Explicación: Iniciamos la preparación previa del grupo de identidades anónimas al cargar el módulo para calentar las cuentas.
+replenishAnonymousPool().catch(err => {
+  logger.error(`[预热池初始化] 预热账号池失败: ${err.message}`);
+});
+
 export default {
   createConversation,
   createCompletion,
@@ -1875,4 +2322,6 @@ export default {
   tokenSplit,
   uploadFile,
   acquireToken,
+  estimateTextTokens,
+  estimateMessagesTokens,
 };
