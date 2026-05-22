@@ -97,8 +97,8 @@ setTimeout(() => {
 let anonymousPoolReplenishing = false;
 const CURRENT_INPUT_FILENAME = "DS2API_HISTORY.txt";
 const CURRENT_INPUT_CONTENT_TYPE = "text/plain; charset=utf-8";
-// Explicación: Cambiamos el valor por defecto de CURRENT_INPUT_MIN_CHARS de 8000 a 200000 (200k) según la solicitud del usuario. Esto permite que el historial de chat se transmita directamente de forma nativa sin comprimirse ni adjuntarse hasta que alcance los 200,000 caracteres, aprovechando al máximo la gran capacidad de contexto del modelo.
-const CURRENT_INPUT_MIN_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS || 200000);
+// Explicación: Cambiamos el valor por defecto de CURRENT_INPUT_MIN_CHARS de 8000 a 120000 (120k) según la solicitud del usuario. Esto permite que el historial de chat se transmita directamente de forma nativa sin comprimirse ni adjuntarse hasta que alcance los 120,000 caracteres, aprovechando al máximo la gran capacidad de contexto del modelo.
+const CURRENT_INPUT_MIN_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS || 120000);
 const CURRENT_INPUT_LIVE_MAX_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_LIVE_MAX_CHARS || 8000);
 const CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_SUMMARIZE_THRESHOLD_CHARS || 15000);
 const CURRENT_INPUT_SUMMARY_MAX_CHARS = Number(process.env.STEPFUN_CURRENT_INPUT_SUMMARY_MAX_CHARS || 8000);
