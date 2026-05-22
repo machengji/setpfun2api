@@ -3,7 +3,7 @@ import pkg from './package.json';
 
 export default defineConfig({
   entry: ['src/index.ts'],
-  format: ['cjs', 'esm'],
+  format: ['cjs'],
   dts: true,
   sourcemap: true,
   clean: true,
