@@ -1231,34 +1231,72 @@ function cleanMessageContentForPrepare(content: any): string {
   if (!content) return "";
   let text = _.isString(content) ? content : normalizeMessageContentForTranscript(content);
   
-  // Explicación: Limpiamos y restauramos los mensajes del historial que contienen resúmenes largos o instrucciones de continuación interna, extrayendo únicamente la pregunta real del usuario para evitar el crecimiento exponencial del contexto y bloqueos en Playwright.
+  // Explicación: Limpiamos y restauramos los mensajes del historial que contienen resúmenes largos o instrucciones de continuación interna, extrayendo únicamente la pregunta real del usuario para evitar el contexto redundante.
   if (/Use the provided prior context internally/i.test(text)) {
     const match = text.match(/(?:Latest user request|latest user request):\s*([\s\S]+)$/i);
     if (match && match[1]) {
-      return match[1].trim();
+      text = match[1].trim();
     }
   }
+
+  // Explicación: Limitamos el tamaño de cada mensaje individual a 30,000 caracteres para evitar que una sola respuesta de búsqueda web o registros masivos saturen el límite de tokens (120k) de StepFun. Conservamos 15k del inicio y 15k del final para no perder información valiosa de introducción y conclusión.
+  const SINGLE_MESSAGE_MAX_CHARS = 30000;
+  if (text.length > SINGLE_MESSAGE_MAX_CHARS) {
+    const half = Math.floor(SINGLE_MESSAGE_MAX_CHARS / 2);
+    text = text.slice(0, half) + "\n\n[... CONTENIDO EXCESIVO OMITIDO Y RECORTADO POR EL SISTEMA PARA EVITAR DESBORDAMIENTO ...]\n\n" + text.slice(-half);
+  }
+
   return text;
 }
 
 function messagesPrepare(chatSessionId: string, messages: any[], refs: any[], stepModel = 'step-auto') {
   const attachments = refs.map(formatStepFunAttachment).filter(Boolean);
-  const content =
-    messages.reduce((content, message) => {
-      if (_.isArray(message.content)) {
-        return message.content.reduce((_content, v) => {
-          if (!_.isObject(v) || v["type"] != "text") return _content;
-          const cleanedText = cleanMessageContentForPrepare(v["text"]);
-          const text = scrubExternalContent(cleanedText);
-          if (!text) return _content;
-          return _content + `${message.role || "user"}:${text || ""}\n`;
-        }, content);
-      }
+
+  // Explicación: Preprocesamos y extraemos de forma limpia el texto de cada mensaje aplicando el límite individual.
+  const processedMessages = messages.map(message => {
+    let text = "";
+    if (_.isArray(message.content)) {
+      text = message.content.reduce((_content, v) => {
+        if (!_.isObject(v) || v["type"] != "text") return _content;
+        const cleanedText = cleanMessageContentForPrepare(v["text"]);
+        const cleaned = scrubExternalContent(cleanedText);
+        return _content + (cleaned ? `${cleaned}\n` : "");
+      }, "").trim();
+    } else {
       const cleanedContent = cleanMessageContentForPrepare(message.content);
-      const msgContent = scrubExternalContent(cleanedContent);
-      if (!msgContent) return content;
-      return (content += `${message.role || "user"}:${msgContent}\n`);
-    }, `system:${CHINESE_REPLY_PROMPT}\n`) + "assistant:";
+      text = scrubExternalContent(cleanedContent).trim();
+    }
+    return {
+      role: message.role || "user",
+      text: text
+    };
+  }).filter(item => item.text.length > 0);
+
+  // Explicación: Para evitar el desbordamiento de tokens y errores de "prompt exceed max len 120000" de StepFun, implementamos un truncamiento adaptativo de historial con prioridad para los mensajes más recientes. Recorremos en orden inverso y dejamos de acumular si superamos los 90,000 caracteres, descartando las conversaciones más antiguas de manera elegante.
+  const GLOBAL_CONTEXT_MAX_CHARS = 90000;
+  let accumulatedLength = 0;
+  const keptMessages: typeof processedMessages = [];
+  let isTruncated = false;
+
+  for (let i = processedMessages.length - 1; i >= 0; i--) {
+    const item = processedMessages[i];
+    const msgLen = item.role.length + item.text.length + 3; // `${role}:${text}\n`
+    if (accumulatedLength + msgLen > GLOBAL_CONTEXT_MAX_CHARS) {
+      isTruncated = true;
+      break;
+    }
+    keptMessages.unshift(item);
+    accumulatedLength += msgLen;
+  }
+
+  let content = `system:${CHINESE_REPLY_PROMPT}\n`;
+  if (isTruncated) {
+    content += "system:[更早的对话历史由于平台提示词长度限制，已被系统自动省略]\n";
+  }
+
+  content = keptMessages.reduce((acc, item) => {
+    return acc + `${item.role}:${item.text}\n`;
+  }, content) + "assistant:";
 
   logPrompt(content);
 
