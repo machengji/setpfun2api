@@ -12,13 +12,24 @@
   "files": [
     "dist/"
   ],
+  "bin": "dist/index.cjs",
   "scripts": {
-    "dev": "tsup src/index.ts --format cjs,esm --sourcemap --dts --publicDir public --watch --onSuccess \"node --enable-source-maps dist/index.js\"",
-    "dev:browser": "set STEPFUN_BROWSER_MODE=1&& tsup src/index.ts --format cjs,esm --sourcemap --dts --publicDir public --watch --onSuccess \"node --enable-source-maps dist/index.js\"",
-    "dev:anon": "set STEPFUN_ANONYMOUS_MODE=1&& tsup src/index.ts --format cjs,esm --sourcemap --dts --publicDir public --watch --onSuccess \"node --enable-source-maps dist/index.js\"",
+    "dev": "tsup --watch --onSuccess \"node --enable-source-maps dist/index.js\"",
+    "dev:browser": "set STEPFUN_BROWSER_MODE=1&& tsup --watch --onSuccess \"node --enable-source-maps dist/index.js\"",
+    "dev:anon": "set STEPFUN_ANONYMOUS_MODE=1&& tsup --watch --onSuccess \"node --enable-source-maps dist/index.js\"",
     "start:anon": "set STEPFUN_ANONYMOUS_MODE=1&& node --enable-source-maps dist/index.js",
     "start": "node --enable-source-maps dist/index.js",
-    "build": "tsup src/index.ts --format cjs,esm --sourcemap --dts --clean --publicDir public"
+    "build": "tsup",
+    "package": "npm run build && pkg ."
+  },
+  "pkg": {
+    "assets": [
+      "public/**/*"
+    ],
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "dist"
   },
   "author": "Vinlic",
   "license": "ISC",
@@ -37,7 +48,7 @@
     "koa-router": "^12.0.1",
     "koa2-cors": "^2.0.6",
     "lodash": "^4.17.21",
-    "mime": "^4.0.1",
+    "mime": "^3.0.0",
     "minimist": "^1.2.8",
     "playwright": "^1.52.0",
     "randomstring": "^1.3.0",
@@ -47,6 +58,7 @@
   "devDependencies": {
     "@types/lodash": "^4.14.202",
     "@types/mime": "^3.0.4",
+    "pkg": "^5.8.1",
     "tsup": "^8.0.2",
     "typescript": "^5.3.3"
   }

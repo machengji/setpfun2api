@@ -4,4 +4,6 @@ logs/
 .vercel
 data/
 config/api.json
-
+.env
+*.exe
+scratch/

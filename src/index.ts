@@ -1,11 +1,14 @@
 "use strict";
 
+import "@/lib/envLoader.ts";
 import environment from "@/lib/environment.ts";
 import config from "@/lib/config.ts";
 import "@/lib/initialize.ts";
 import server from "@/lib/server.ts";
 import routes from "@/api/routes/index.ts";
 import logger from "@/lib/logger.ts";
+
+import { fatalExit } from "@/lib/initialize.ts";
 
 const startupTime = performance.now();
 
@@ -25,10 +28,17 @@ const startupTime = performance.now();
 
   config.service.bindAddress &&
     logger.success("Service bind address:", config.service.bindAddress);
+
+  // 保持前台标准输入流活跃，强行阻断 Windows 自动关闭双击拉起的控制台窗口
+  if ((process as any).pkg) {
+    logger.info("Control console active. Press Ctrl+C to terminate.");
+    process.stdin.resume();
+  }
 })()
   .then(() =>
     logger.success(
       `Service startup completed (${Math.floor(performance.now() - startupTime)}ms)`
     )
   )
-  .catch((err) => console.error(err));
+  .catch((err) => fatalExit(err));
+
