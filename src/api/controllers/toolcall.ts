@@ -115,7 +115,9 @@ export function containsOpenToolCall(text: string): boolean {
   let openIndex = Math.max(
     lower.lastIndexOf('<|dsml|tool_calls'),
     lower.lastIndexOf('<tool_calls'),
-    lower.lastIndexOf('<tool_call')
+    lower.lastIndexOf('<tool_call'),
+    lower.lastIndexOf('<|dsml|invoke'),
+    lower.lastIndexOf('<invoke')
   );
   if (openIndex < 0) {
     const dsmlRegex = /<\|dsml\|(?!tool_calls\b|invoke\b|parameter\b)([a-z0-9_.:-]+)/gi;
@@ -133,7 +135,11 @@ export function containsOpenToolCall(text: string): boolean {
     return false;
   }
   const after = lower.slice(openIndex);
-  return !after.includes('</|dsml|tool_calls>') && !after.includes('</tool_calls>') && !after.includes('</tool_call>');
+  return !after.includes('</|dsml|tool_calls>') && 
+         !after.includes('</tool_calls>') && 
+         !after.includes('</tool_call>') &&
+         !after.includes('</|dsml|invoke>') &&
+         !after.includes('</invoke>');
 }
 
 function normalizeDSMLToolCallMarkup(text: string): string | null {
@@ -156,19 +162,32 @@ function normalizeDSMLToolCallMarkup(text: string): string | null {
 
 function parseXMLToolCalls(text: string): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
-  const wrapperRegex = /<tool_calls[^>]*>([\s\S]*?)<\/tool_calls\s*>/gi;
-  let match: RegExpExecArray | null;
-  while ((match = wrapperRegex.exec(text)) !== null) {
-    const rawWrapper = match[0];
-    const body = match[1];
-    const invokeRegex = /<invoke\s+name\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/invoke\s*>/gi;
-    let im: RegExpExecArray | null;
-    while ((im = invokeRegex.exec(body)) !== null) {
-      const name = im[1].trim();
-      if (!name) continue;
-      calls.push({ name, input: parseXMLParameters(im[2]), raw: rawWrapper });
+  
+  if (/<tool_calls\b/i.test(text)) {
+    const wrapperRegex = /<tool_calls[^>]*>([\s\S]*?)<\/tool_calls\s*>/gi;
+    let match: RegExpExecArray | null;
+    while ((match = wrapperRegex.exec(text)) !== null) {
+      const rawWrapper = match[0];
+      const body = match[1];
+      const invokeRegex = /<invoke\s+name\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/invoke\s*>/gi;
+      let im: RegExpExecArray | null;
+      while ((im = invokeRegex.exec(body)) !== null) {
+        const name = im[1].trim();
+        if (!name) continue;
+        calls.push({ name, input: parseXMLParameters(im[2]), raw: rawWrapper });
+      }
     }
+    if (calls.length > 0) return calls;
   }
+
+  const singleInvokeRegex = /<invoke\s+name\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/invoke\s*>/gi;
+  let sim: RegExpExecArray | null;
+  while ((sim = singleInvokeRegex.exec(text)) !== null) {
+    const name = sim[1].trim();
+    if (!name) continue;
+    calls.push({ name, input: parseXMLParameters(sim[2]), raw: sim[0] });
+  }
+
   return calls;
 }
 
