@@ -101,6 +101,7 @@ STEPFUN_ANONYMOUS_MODE=1 STEPFUN_BROWSER_MODE=1 node dist/index.js
 | `STEPFUN_BROWSER_MODE` | 设定为 `1` 时启用 Playwright 浏览器托管，以完美规避风控。 | `未设置` |
 | `STEPFUN_ANONYMOUS_MODE` | 设定为 `1` 时开启免账号匿名池模式。 | `未设置` |
 | `STEPFUN_ANONYMOUS_ROTATE_AFTER` | 单个匿名身份的最大使用对话轮数，到期强制后台平滑轮换。 | `3` |
+| `STEPFUN_MEMBER_ROTATE_AFTER` | 有账号模式下，每个账号最多连续使用的对话轮数。到期后自动平滑轮换到下一个可用账号，防止频繁跳号导致 Session 丢失。 | `6` |
 | `STEPFUN_ANONYMOUS_POOL_SIZE` | 预热匿名身份池的大小。若高频或并发使用建议调大此值。 | `8` |
 | `STEPFUN_CURRENT_INPUT_FILE_MIN_CHARS` | **上下文压缩/文件化起征字符数**。只有当历史会话达到该长度时，才会触发云端文件归档，从而最大程度榨干 StepFun 原生超大上下文的实力。 | `120000` (约 120k 字符) |
 | `STEPFUN_CURRENT_INPUT_LIVE_MAX_CHARS` | 单次交互中允许的最大活跃上下文截断上限。 | `8000` |
