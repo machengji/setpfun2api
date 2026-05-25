@@ -1227,6 +1227,38 @@ function resolveStepFunModel(model: string): string {
   return 'step-auto';
 }
 
+// Explicación: Condensa el contenido de una página web eliminando el ruido típico como pies de página, advertencias legales, enlaces de redes sociales, menús de navegación redundantes y un exceso de saltos de línea. Esto purifica el texto para conservar únicamente el contenido informativo sustancial o tablas de datos, optimizando drásticamente el espacio del prompt.
+function condenseWebContent(text: string): string {
+  if (!text) return "";
+  const lines = text.split("\n");
+  const noisyKeywords = [
+    "copyright", "版权所有", "保留所有权利", "关于我们", "法律声明", "友情链接", "诚聘英才", 
+    "联系我们", "安全指引", "隐私政策", "违法 and 不良信息举报", "icp备", "公安网备", 
+    "客服电话", "分享到", "新浪微博", "微信扫一扫", "关注微信", "下一篇", "上一篇",
+    "免责声明", "风险提示", "投资需谨慎", "仅供参考", "不构成投资建议"
+  ];
+
+  const filteredLines = lines.map(line => {
+    const trimmed = line.trim();
+    if (!trimmed) return "";
+    
+    // Explicación: Filtramos las líneas que funcionan puramente como barra de navegación de enlaces cortos.
+    const separatorsCount = (trimmed.match(/[|/·•]/g) || []).length;
+    if (separatorsCount > 3 && trimmed.length < 150) {
+      return "";
+    }
+    
+    const lower = trimmed.toLowerCase();
+    if (noisyKeywords.some(keyword => lower.includes(keyword))) {
+      return "";
+    }
+    
+    return trimmed;
+  }).filter(line => line.length > 0);
+
+  return filteredLines.join("\n");
+}
+
 function cleanMessageContentForPrepare(content: any): string {
   if (!content) return "";
   let text = _.isString(content) ? content : normalizeMessageContentForTranscript(content);
@@ -1239,8 +1271,14 @@ function cleanMessageContentForPrepare(content: any): string {
     }
   }
 
-  // Explicación: Limitamos el tamaño de cada mensaje individual a 30,000 caracteres para evitar que una sola respuesta de búsqueda web o registros masivos saturen el límite de tokens (120k) de StepFun. Conservamos 15k del inicio y 15k del final para no perder información valiosa de introducción y conclusión.
-  const SINGLE_MESSAGE_MAX_CHARS = 30000;
+  // Explicación: Si el mensaje contiene un texto largo que parece ser una captura web (más de 20,000 caracteres), primero lo purificamos y condensamos eliminando el ruido periférico para conservar el 100% de los datos principales (como tablas de cotizaciones y flujos de capital).
+  const WEB_CONDENSE_THRESHOLD = 20000;
+  if (text.length > WEB_CONDENSE_THRESHOLD) {
+    text = condenseWebContent(text);
+  }
+
+  // Explicación: Limitamos el tamaño estricto de cada mensaje individual a 55,000 caracteres (en lugar de 30k) para permitir la retención completa de grandes tablas de datos financieros, manteniéndolo completamente seguro gracias a nuestro límite de retroceso global de 90k. Si se supera, conservamos 25k del inicio y 25k del final.
+  const SINGLE_MESSAGE_MAX_CHARS = 55000;
   if (text.length > SINGLE_MESSAGE_MAX_CHARS) {
     const half = Math.floor(SINGLE_MESSAGE_MAX_CHARS / 2);
     text = text.slice(0, half) + "\n\n[... CONTENIDO EXCESIVO OMITIDO Y RECORTADO POR EL SISTEMA PARA EVITAR DESBORDAMIENTO ...]\n\n" + text.slice(-half);
